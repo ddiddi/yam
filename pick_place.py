@@ -111,6 +111,23 @@ SHUTTLE_R = 0.33  # m: --shuttle sets the object down outward (+x) nearer the ba
 # ---- grasp-mode decision (step 3) ---------------------------------------------------------------
 H_TOP_MIN = 0.045  # m: below this there is no band above the table to clamp from above
 RATIO_MIN = 0.6  # height/diameter below this the object is "flat" (wide and low)
+FINGER_REACH = 0.081  # m: fingertip to the gripper housing's face, along the fingers (the arm model)
+
+
+TOP_Z_MIN = 0.014  # m: a top grasp's fingertips never close lower (the side grasps run theirs at Z_TIP_MIN 1.2 cm)
+SIDE_CROSS_MAX = 0.6  # a side grasp's fingers must cross the object's axis within its lower 60%
+SEAT_TIPS_ONLY = 9.9  # a SEAT_BACKOFF this large leaves no depth: the fingertips stop at the object's centre line
+SEAT_BACKOFFS = (0.0, 0.015, 0.03, SEAT_TIPS_ONLY)  # the last: only for what nothing deeper can take (a flat dish)  # m: full depth first, then these much shallower if full depth has no safe path
+SEAT_BACKOFF = 0.0  # the one the current plan was made (and must be executed) with
+
+
+def seat_depth(obj: "Obj") -> float:
+    """How far inside the jaw the object's near side sits, measured from the fingertips: as deep as the
+    target clearance allows - its near side (tolerance + 5 mm) from the housing - so the fingers close on
+    it along most of their length, from their base, not with the tips (less SEAT_BACKOFF when the full
+    depth leaves no safe approach or retreat)."""
+    tol = TALL_TOL if safe_height(obj) > TALL_H else TARGET_TOL
+    return FINGER_REACH - tol - 0.005 - SEAT_BACKOFF
 H_TOP_MAX = 0.16  # m: above this, reaching over the top is tippy; clamp the body from the side instead
 Z_SIDE_GRASP = 0.02  # m: a side grasp closes this high - at the bottom of the object, where it is steadiest
 # ---- detection ----------------------------------------------------------------------------------
@@ -144,6 +161,27 @@ class Obj:
     color: tuple[int, int, int]
     contour: np.ndarray | None = field(repr=False, default=None)
     measured: bool = False  # from --given: its height is trusted, not floored to TARGET_H_FLOOR
+    # dimensional analysis: the footprint as an oriented rectangle (length >= width) and the long side's
+    # direction (rad, robot frame). None = unmeasured, treated as round with `diameter`.
+    length: float | None = None
+    width: float | None = None
+    angle: float | None = None
+    dims_from: str = "single view (depth not measured: treated as round)"
+    xy_uncertain: bool = False  # found by depth alone: its position along the line of sight is +-2 cm
+
+    @property
+    def grip_width(self) -> float:
+        """What the jaw must span: the footprint's short side when it is measured, else the diameter."""
+        return self.width if self.width is not None else self.diameter
+
+    @property
+    def long_axis(self) -> np.ndarray | None:
+        """Unit xy vector of the long side when the object is clearly elongated, else None (round)."""
+        if self.length is None or self.width is None or self.angle is None:
+            return None
+        if self.length < ELONGATED * max(self.width, 1e-6):
+            return None
+        return np.array([np.cos(self.angle), np.sin(self.angle)])
 
     @property
     def radius(self) -> float:
@@ -159,9 +197,15 @@ class Obj:
         return self.height / max(self.diameter, 1e-6)
 
     def describe(self) -> str:
+        dims = ""
+        if self.length is not None:
+            dims = (f"\n            dims {self.length * 100:.1f} x {self.width * 100:.1f} x {self.height * 100:.1f} cm"
+                    f" (L x W x H), long side at {np.degrees(self.angle):+.0f} deg - {self.dims_from}")
+        else:
+            dims = f"\n            dims {self.dims_from}"
         return (f"{self.name:<9} xy ({self.xy[0]:+.3f}, {self.xy[1]:+.3f})  d {self.diameter * 100:5.1f} cm"
                 f"  h {self.height * 100:5.1f} cm  h/d {self.flatness:4.1f}  reach {self.reach:.2f} m"
-                f"  rgb {tuple(self.color)}")
+                f"  rgb {tuple(self.color)}{dims}")
 
 
 def table_foreground(frame: np.ndarray, bg: np.ndarray, quiet: bool = False) -> np.ndarray:
@@ -265,6 +309,12 @@ def full_height(cam: CameraModel, sil: np.ndarray, raw: np.ndarray, h: float) ->
         return h
     o2 = object_from_blob(cam, ext.astype(np.uint8) * 255)
     return max(h, o2["height"]) if o2 else h
+
+
+ELONGATED = 1.3  # length/width above this: the object has a short side the jaw must close across
+# (a single view cannot measure depth: cam1 looks at the zone so shallowly that 1 cm of height error moves the
+# far edge of a footprint by several cm - a 6.7 cm bottle read 14.6 cm long - so only the carved multi-view
+# footprint, or a hand measurement, gives an object a short side)
 
 
 def survey(frame: np.ndarray, cam: CameraModel, min_area: float = 2000.0,
@@ -416,8 +466,20 @@ def carve(frames: dict[str, np.ndarray], cams: dict[str, CameraModel],
             continue
         blobs.append({"xy": (float(gx[cells].mean()), float(gy[cells].mean())),
                       "area": float(cells.sum() * VOXEL * VOXEL), "height": float(hmap[cells].max()),
-                      "views": int(vmap[cells].max())})
+                      "views": int(vmap[cells].max()), "cells": np.c_[gx[cells], gy[cells]]})
     return blobs
+
+
+def carved_footprint(cells: np.ndarray) -> tuple[float, float, float] | None:
+    """(length, width, long-side angle) of the smallest rectangle around a blob's solid columns."""
+    if len(cells) < 4:
+        return None
+    (cx, cy), (a, b), ang = cv2.minAreaRect((cells * 1000.0).astype(np.float32))
+    a, b = a / 1000.0 + VOXEL, b / 1000.0 + VOXEL  # column centres -> column edges
+    th = np.radians(ang)
+    if a < b:
+        a, b, th = b, a, th + np.pi / 2
+    return float(a), float(b), float((th + np.pi / 2) % np.pi - np.pi / 2)
 
 
 def survey_multi(frames: dict[str, np.ndarray], cams: dict[str, CameraModel], min_area: float = 2000.0,
@@ -444,6 +506,13 @@ def survey_multi(frames: dict[str, np.ndarray], cams: dict[str, CameraModel], mi
             print(f"   {o.name}: {b['views']} views put it at {np.round(b['xy'], 3)} ({d * 100:.1f} cm from the "
                   f"single-camera estimate), {b['height'] * 100:.1f} cm tall")
             o.xy = b["xy"]
+            rect = carved_footprint(b["cells"])
+            if rect is not None:
+                o.length, o.width, o.angle = rect
+                o.dims_from = f"carved from {b['views']} views"
+                o.diameter = max(o.diameter, o.length)  # the clearance cylinder spans the long side
+                print(f"   {o.name}: footprint {o.length * 100:.1f} x {o.width * 100:.1f} cm, long side at "
+                      f"{np.degrees(o.angle):+.0f} deg ({'has a short side' if o.long_axis is not None else 'round'})")
             # the carved top of the columns near this object only: the whole blob's top included two-view
             # ghosts (15-16 cm for a 11 cm bottle), and the detection camera alone reads short whenever the
             # parked arm's mask covers the cap (5.3 cm) - locally carved it came back 10.0 cm
@@ -462,6 +531,80 @@ def survey_multi(frames: dict[str, np.ndarray], cams: dict[str, CameraModel], mi
 
 
 CAM_MOVED_PX = 3.0  # px: a camera whose fixed background has shifted more than this no longer fits its calibration
+
+
+DEPTH_WORLD: dict = {}  # the first scene analysis' metric height map (depth.py): H, lo, for the path check
+DEPTH_MATCH = 0.06  # m: a depth object this close to a detected one is the same object
+
+
+DEPTH_FRAMES = 5  # frames of the still scene the depth analysis must agree over
+
+
+def fuse_depth(objs: list[Obj], frame: np.ndarray, cam: CameraModel, ignore: np.ndarray | None = None,
+               key: str = DET, more: list | None = None) -> list[Obj]:
+    """Depth Anything V2 (depth.py) on the detection camera, pinned to the calibrated table: every object's
+    height and footprint from its own 3D points, and the objects background subtraction cannot see.
+
+    What one view measures well: heights (+-1 cm), extents across the line of sight, the direction of a
+    clearly long object. What it cannot: extent *along* the line of sight (the network's metric error, 2-3
+    cm at this range, all lands there - a 4.8 cm deep box read 9 cm). So a footprint is only given a short
+    side when it is clearly elongated (DEPTH_ELONGATED); otherwise the object stays round, sized by its
+    larger side - the jaw then opens for it or the plan is refused, never guesses."""
+    import depth
+
+    try:
+        with np.errstate(all="ignore"):
+            r = depth.analyse_multi([frame] + list(more or []), cam, key, ignore=ignore)
+    except Exception as e:
+        print(f"   (depth analysis skipped: {e})")
+        return objs
+    DEPTH_WORLD.update(H=r["H"], lo=r["lo"])
+    print(f"   depth (Depth Anything V2 Small, {r.get('frames', 1)} frame(s), {r['inference_s']} s): table fit rms "
+          f"{r['fit']['table_rms_mm']:.1f} mm, {len(r['objects'])} stable object(s) -> captures/depth_{key}.jpg")
+    for d in r.get("dropped", []):
+        print(f"   (ignored a depth blob at {np.round(d['xy'], 3)}, {d['height'] * 100:.1f} cm: in {d['frames']}/"
+              f"{r.get('frames', 1)} frames, wandering {d['spread_mm']} mm - not a real object)")
+    used = set()
+    for o in objs:
+        ds = [float(np.hypot(*(np.array(d["xy"]) - np.array(o.xy)))) for d in r["objects"]]
+        j = int(np.argmin(ds)) if ds else -1
+        if j < 0 or ds[j] > DEPTH_MATCH or j in used:
+            print(f"   {o.name}: no depth match - keeping the camera-survey measurement")
+            continue
+        used.add(j)
+        _apply_depth(o, r["objects"][j], keep_xy=True)
+    for j, d in enumerate(r["objects"]):
+        if j in used:
+            continue
+        o = Obj(f"depth{j}", d["xy"], d["length"] + DEPTH_EDGE, d["height"], (200, 200, 200), xy_uncertain=True)
+        _apply_depth(o, d, keep_xy=False)
+        print(f"   NEW from depth only (white/clear on the sheet?): {o.describe()}")
+        objs.append(o)
+    return objs
+
+
+DEPTH_EDGE = 0.01  # m: the depth-step filter shaves ~5 mm off each side of an object against the table
+DEPTH_ELONGATED = 1.8  # length/width from one view's depth above which the long side's direction is trusted
+
+
+def _apply_depth(o: Obj, d: dict, keep_xy: bool) -> None:
+    L, W = d["length"] + DEPTH_EDGE, d["width"] + DEPTH_EDGE
+    print(f"   {o.name}: depth says {L * 100:.1f} x {W * 100:.1f} x {d['height'] * 100:.1f} cm "
+          f"(was h {o.height * 100:.1f} cm)")
+    # depth measures tall things well but eats small ones (its edge filter strips a 3.5 cm wedge down to
+    # 1.9 cm); a silhouette under-reads shiny caps. For an object both saw, the larger is the safer.
+    o.height = float(d["height"]) if not keep_xy else max(o.height, float(d["height"]))
+    o.measured = True
+    if not keep_xy:
+        o.xy = d["xy"]
+    if L >= DEPTH_ELONGATED * W:
+        o.length, o.width, o.angle = L, W, float(d["angle"])
+        o.diameter = max(o.diameter, L)
+        o.dims_from = "depth (one view): long side's direction and width measured"
+    else:
+        o.diameter = max(o.diameter, L)
+        o.dims_from = (f"depth (one view): {L * 100:.1f} cm across, depth along the line of sight not "
+                       "measurable - treated as round")
 
 
 def camera_shift(key: str, frame: np.ndarray) -> float:
@@ -496,6 +639,25 @@ def still_cameras(frames: dict[str, np.ndarray], models: dict) -> dict:
     if DET not in keep:
         raise RuntimeError(f"the detection camera {DET} has moved since its calibration: recalibrate before running")
     return keep
+
+
+def grab_more(key: str, n: int) -> list[np.ndarray]:
+    """n more frames of one camera, ~0.35 s apart (one open of the device)."""
+    cap = cv2.VideoCapture(int(key[3:]))
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    out = []
+    try:
+        for _ in range(n):
+            for _ in range(4):
+                cap.grab()
+            ok, f = cap.read()
+            if ok:
+                out.append(f)
+            time.sleep(0.25)
+    finally:
+        cap.release()
+    return out
 
 
 def grab_all(args: "Args") -> dict[str, np.ndarray]:
@@ -692,15 +854,25 @@ def carried_points(obj: Obj, z_grasp: float, ahead=(0.0, 0.0)):
     return f
 
 
+def side_deep(obj: "Obj", zg: np.ndarray) -> float:
+    """Horizontal distance a side grasp's fingertips travel PAST the object's axis, so the axis crosses the
+    fingers seat_depth - (half the object along the approach) from their tips: the object sits at the base
+    of the fingers. zg is the (unit, 3D) approach direction; its horizontal part scales depth to xy."""
+    half = obj.length / 2 if obj.long_axis is not None else obj.radius  # a long object is entered along its length
+    s = max(0.0, seat_depth(obj) - half)  # the axis' depth from the tips
+    return float(s * np.linalg.norm(zg[:2]))
+
+
 def grasp_ahead(planner: "AzPlanner", plan: "Plan") -> np.ndarray:
-    """Where the object's axis sits relative to the fingertips once grasped (xy): SLIDE_SHORT along the
-    approach for a side grasp, nothing for a top grasp."""
+    """Where the object's axis sits relative to the fingertips once grasped (xy): for a side grasp it is
+    behind them by side_deep (minus SLIDE_SHORT), towards the housing; nothing for a top grasp."""
     if plan.mode != "side":
         return np.zeros(2)
     keep = planner.az
-    zg = planner.approach_dir(plan.pick, plan.yaw, plan.tilt, plan.az)[:2]
+    zg = planner.approach_dir(plan.pick, plan.yaw, plan.tilt, plan.az)
     planner.az = keep
-    return SLIDE_SHORT * zg / (np.linalg.norm(zg) + 1e-9)
+    u = zg[:2] / (np.linalg.norm(zg[:2]) + 1e-9)
+    return (SLIDE_SHORT - side_deep(plan.obj, zg)) * u
 
 
 def table_floor(z_from: float, z_to: float) -> float:
@@ -716,14 +888,14 @@ def follow(arm: Arm, planner: AzPlanner, ws: "Workspace", qs: list, seconds: flo
     from the MEASURED joints, because that is where `Arm.glide` starts; after `settle` the commanded pose
     is deliberately off (it compensates sag) and the model puts it lower than the arm really is."""
     q = arm.q()
-    for q_next in qs:
+    for q_next in qs:  # the whole leg is re-checked first, then travelled as one smooth motion
         gap, who, zmin = ws.scan(q, np.asarray(q_next, dtype=float), carry)
         if floor_z is not None and zmin < floor_z:
             raise RuntimeError(f"a planned segment would reach {zmin * 100:.1f} cm: too low")
         if gap < 0:
             raise RuntimeError(f"a planned segment would enter {who}")
-        arm.glide(np.asarray(q_next, dtype=float), seconds / len(qs))
         q = np.asarray(q_next, dtype=float)
+    arm.glide_path([np.asarray(v, dtype=float) for v in qs], seconds)
 
 
 def move_line(arm: Arm, planner: AzPlanner, ws: "Workspace", xyz, yaw: float, tilt: float, seconds: float,
@@ -746,7 +918,8 @@ def move_line(arm: Arm, planner: AzPlanner, ws: "Workspace", xyz, yaw: float, ti
         q = arm.q()
     n = max(1, int(np.linalg.norm(p1 - p0) / step))
     floor = table_floor(p0[2], p1[2])
-    for i in range(1, n + 1):
+    path = []
+    for i in range(1, n + 1):  # solved and checked end to end first, then one smooth motion
         p = p0 + (p1 - p0) * i / n
         q_next, _, _ = planner.ik(p[0], p[1], p[2], q, yaw, tilt)
         gap, who, zmin = ws.scan(q, q_next, carry)
@@ -754,8 +927,9 @@ def move_line(arm: Arm, planner: AzPlanner, ws: "Workspace", xyz, yaw: float, ti
             raise RuntimeError(f"segment towards {np.round(p, 3)} would reach {zmin * 100:.1f} cm: too low")
         if gap < 0:
             raise RuntimeError(f"segment towards {np.round(p, 3)} would enter {who}")
-        arm.glide(q_next, seconds / n)
+        path.append(q_next)
         q = q_next
+    arm.glide_path(path, seconds)
 
 
 def fmt_gap(g: float) -> str:
@@ -776,9 +950,10 @@ def free_gap(xy, obstacles: list[Obj], extra: float = 0.0) -> tuple[float, str]:
 # ============================================================================== step 3: decision
 def decide_grasp(obj: Obj) -> tuple[str, str]:
     """VERTICAL (top-down) or HORIZONTAL (side), from the object's flatness and height."""
-    h, d, f = obj.height, obj.diameter, obj.flatness
+    h, d, f = obj.height, obj.grip_width, obj.flatness
     if d > MAX_OBJ_WIDTH:
-        raise RuntimeError(f"{obj.name} is {d * 100:.1f} cm wide, the jaw only spans "
+        side = "its narrowest side is" if obj.long_axis is not None else "it is"
+        raise RuntimeError(f"{obj.name}: {side} {d * 100:.1f} cm, the jaw only spans "
                            f"{MAX_OBJ_WIDTH * 100:.0f} cm (pick another --object)")
     if h < H_TOP_MIN:
         return "side", (f"low object ({h * 100:.1f} cm < {H_TOP_MIN * 100:.0f} cm): closing from above would "
@@ -795,7 +970,9 @@ def decide_grasp(obj: Obj) -> tuple[str, str]:
 def grasp_height(mode: str, obj: Obj) -> float:
     """Fingertip height at the moment of closing."""
     if mode == "top":
-        return float(np.clip(0.45 * obj.height, 0.02, 0.09))
+        # full depth: the fingertips go down until the object's top is seat_depth inside the jaw (it was
+        # 45% of the height, then 4.5 cm below the top - a pinch with the tips)
+        return float(max(TOP_Z_MIN, obj.height - seat_depth(obj)))
     return float(np.clip(min(Z_SIDE_GRASP, 0.5 * obj.height), Z_TIP_MIN, 0.10))
 
 
@@ -803,7 +980,10 @@ def travel_height(obj: Obj, obstacles: list[Obj], z_grasp: float) -> float:
     """High enough that the carried object (which hangs z_grasp below the fingertips) clears everything,
     and that the fingertips hovering over the target on the way in clear its own top (they are exempt from
     the target clearance check, so a 25 cm wash bottle under a 20 cm hover was never flagged)."""
-    tallest = max([o.height for o in obstacles] + [safe_height(obj) - z_grasp, 0.0])
+    # the target's own top gets 25% extra when it is tall: thin parts above its body (a wash bottle's spout,
+    # a handle) are what depth and silhouettes miss, and the fingertips hover right over it
+    top = safe_height(obj) * (1.25 if obj.height > TALL_H else 1.0)
+    tallest = max([o.height for o in obstacles] + [top - z_grasp, 0.0])
     return float(min(max(Z_TRAVEL_MIN, tallest + Z_CLEAR + z_grasp), Z_TRAVEL_MAX))
 
 
@@ -885,11 +1065,17 @@ def build_waypoints(planner: AzPlanner, obj: Obj, mode: str, yaw: float, tilt: f
         # along the front cameras' line of sight, and a slide to the full depth pushed a bottle 1.8 and 2.8 cm
         # with the palm. The jaw's extra opening (TALL_JAW_GAP per side) still takes it; everything after the
         # grasp (lift, carry, lower, release) is shifted by the same amount, so the object lands where planned.
-        short = SLIDE_SHORT * np.r_[zg[:2] / (np.linalg.norm(zg[:2]) + 1e-9), 0.0]
-        x, y = x - short[0], y - short[1]
-        px, py = px - short[0], py - short[1]
-        pre = tuple(np.array([x, y, z_grasp]) - SIDE_APPROACH * zg)
-        pre_place = tuple(np.array([px, py, z_grasp]) - SIDE_APPROACH * zg)
+        # full depth: the fingertips then go on PAST the axis (side_deep) so the object ends up against the
+        # base of the fingers, not pinched by the tips; the pre-grasp backs off far enough that the tips
+        # still start clear of the object's near side
+        u = np.r_[zg[:2] / (np.linalg.norm(zg[:2]) + 1e-9), 0.0]
+        shift = (side_deep(obj, zg) - SLIDE_SHORT) * u
+        x, y = x + shift[0], y + shift[1]
+        px, py = px + shift[0], py + shift[1]
+        half = obj.length / 2 if obj.long_axis is not None else obj.radius
+        back = max(SIDE_APPROACH, seat_depth(obj) + half + 0.04)
+        pre = tuple(np.array([x, y, z_grasp]) - back * zg)
+        pre_place = tuple(np.array([px, py, z_grasp]) - back * zg)
         wps += [
             WP("pre-grasp beside the object", pre, 3.0, settle=True),
             WP("slide the fingers around it", (x, y, z_grasp), 3.0, settle=True),
@@ -985,6 +1171,7 @@ def _walk(planner, ws, plan, q, step, wps, holding, carry, worst, who, legs, low
 
 
 JAW_ACROSS: np.ndarray | None = None  # unit xy direction the jaw must close across (--jaw-across)
+JAW_ALIGN_DEG = 12.0  # how far off square to the long side the jaw may close
 
 
 def pose_options(mode: str) -> list[tuple[float, float, float | None]]:
@@ -1016,9 +1203,11 @@ def grasp_candidates(planner: AzPlanner, ws: Workspace, obj: Obj, mode: str, pic
         az = None if daz is None else radial + daz
         jd = planner.jaw_dir(pick, yaw, tilt, az)[:2]
         jd = jd / (np.linalg.norm(jd) + 1e-9)
-        if mode == "top" and JAW_ACROSS is not None and abs(float(jd @ JAW_ACROSS)) > np.sin(np.radians(12)):
-            continue  # the jaw would close along the handle, landing the fingertips on it
-        probes = [np.array(pick) + s * (obj.radius + JAW_GAP + 0.015) * jd for s in (1, -1)]  # the two tips
+        across = JAW_ACROSS if JAW_ACROSS is not None else obj.long_axis
+        if across is not None and abs(float(jd @ across)) > np.sin(np.radians(JAW_ALIGN_DEG)):
+            continue  # the jaw would close along the long side: too wide, or fingertips landing on a handle
+        half = obj.grip_width / 2 if across is not None else obj.radius
+        probes = [np.array(pick) + s * (half + JAW_GAP + 0.015) * jd for s in (1, -1)]  # the two tips
         if mode == "side":  # ... and the lane the fingers travel down
             ad = planner.approach_dir(pick, yaw, tilt, az)[:2]
             ad = ad / (np.linalg.norm(ad) + 1e-9)
@@ -1029,9 +1218,14 @@ def grasp_candidates(planner: AzPlanner, ws: Workspace, obj: Obj, mode: str, pic
         planner.az = az
         try:
             planner.ik(pick[0], pick[1], z_travel, REST, yaw, tilt)
-            planner.ik(pick[0], pick[1], z_grasp, REST, yaw, tilt)
+            tip = np.array([pick[0], pick[1], z_grasp])
+            if mode == "side":  # where the fingertips really go: past the axis, the object at the finger base
+                zg = planner.approach_dir(pick, yaw, tilt, az)
+                tip[:2] += side_deep(obj, zg) * zg[:2] / (np.linalg.norm(zg[:2]) + 1e-9)
+            planner.ik(tip[0], tip[1], tip[2], REST, yaw, tilt)
             if mode == "side":
-                pre = np.array([pick[0], pick[1], z_grasp]) - SIDE_APPROACH * planner.approach_dir(pick, yaw, tilt, az)
+                half_a = obj.length / 2 if obj.long_axis is not None else obj.radius
+                pre = tip - max(SIDE_APPROACH, seat_depth(obj) + half_a + 0.04) * zg
                 planner.ik(pre[0], pre[1], pre[2], REST, yaw, tilt)
         except RuntimeError:
             continue
@@ -1166,9 +1360,53 @@ def check_servo_point(planner: AzPlanner, ws: Workspace, plan: Plan) -> None:
         ws.target = keep
 
 
+def as_circles(o: Obj) -> list[Obj]:
+    """An elongated obstacle as a chain of short-side-wide cylinders along its length (the planner's
+    clearance model is cylinders); a round one as itself."""
+    ax = o.long_axis
+    if ax is None:
+        return [o]
+    n = int(np.ceil((o.length - o.width) / (o.width / 2))) + 1
+    return [Obj(f"{o.name}[{k}]", (o.xy[0] + t * ax[0], o.xy[1] + t * ax[1]), o.width, o.height, o.color)
+            for k, t in enumerate(np.linspace(-(o.length - o.width) / 2, (o.length - o.width) / 2, n))]
+
+
 def make_plan(objs: list[Obj], index: int, args: "Args", planner: AzPlanner) -> Plan:
+    """The deepest grasp that has a safe path: full depth (the object against the finger base), then
+    SEAT_BACKOFFS shallower. SEAT_BACKOFF stays at the chosen value for the execution."""
+    global SEAT_BACKOFF
+    errors = []
+    for b in SEAT_BACKOFFS:
+        SEAT_BACKOFF = b
+        try:
+            plan = _make_plan(objs, index, args, planner)
+        except RuntimeError as e:
+            errors.append(f"seated {seat_depth(objs[index]) * 100:.1f} cm deep: {e}")
+            continue
+        o = plan.obj
+        if b >= SEAT_TIPS_ONLY:
+            print("  seat: SHALLOWEST - the fingertips stop at the object's centre line; no deeper grasp was possible "
+                  "(for a flat object, a deeper side grasp meets it above its rim)")
+            return plan
+        if plan.mode == "top":  # what is between the fingers: from the tips up to the object's top
+            d = min(seat_depth(o), max(0.0, o.height - plan.z_grasp))
+            where = f"its top {(FINGER_REACH - d) * 100:.1f} cm from the finger base"
+            if o.height - plan.z_grasp < seat_depth(o):
+                where += f"; the fingertips stop {plan.z_grasp * 100:.1f} cm above the table, so it cannot sit deeper"
+        else:
+            d = seat_depth(o)
+            where = f"its back {(FINGER_REACH - d) * 100:.1f} cm from the finger base"
+        print(f"  seat: the fingers wrap {d * 100:.1f} cm of their {FINGER_REACH * 100:.1f} cm length around the "
+              f"object ({where})" + (f" - {b * 100:.1f} cm short of full depth: the full-depth path was not safe"
+                                     if b else " - full depth"))
+        return plan
+    SEAT_BACKOFF = 0.0
+    raise RuntimeError(" || ".join(errors))
+
+
+def _make_plan(objs: list[Obj], index: int, args: "Args", planner: AzPlanner) -> Plan:
     obj = objs[index]
-    obstacles = [o for i, o in enumerate(objs) if i != index]
+    obstacles = [c for i, o in enumerate(objs) if i != index for c in as_circles(o)]
     if not (REACH[0] <= obj.reach <= REACH[1]):
         raise RuntimeError(f"{obj.name} is {obj.reach:.2f} m from the base: outside the safe reach {REACH}")
     mode, reason = decide_grasp(obj)
@@ -1176,6 +1414,11 @@ def make_plan(objs: list[Obj], index: int, args: "Args", planner: AzPlanner) -> 
         mode, reason = args.grasp, f"forced by --grasp {args.grasp}"
     ws = Workspace(planner, obstacles, args.margin)
     modes = [mode] if args.grasp != "auto" else [mode] + [m for m in ("top", "side") if m != mode]
+    if args.grasp == "side" and not args.side_only:
+        # when no side grasp can seat the object deep in the jaw (a long object entered along its length, or a
+        # low one the 60-degree fingers would cross above its top), take it from above - still full depth,
+        # still across the short side - rather than pinch it or not pick it at all
+        modes.append("top")
     tried: list[str] = []
     fallback = None  # a plan that passes as detected but not with the pick shifted by a centimetre
     for m in modes:
@@ -1183,6 +1426,15 @@ def make_plan(objs: list[Obj], index: int, args: "Args", planner: AzPlanner) -> 
         # a side grasp at the very bottom may leave the housing too close to a tall body: try a little higher
         zs = [z0] if (args.z_grasp is not None or m != "side") else [z0, z0 + 0.015, z0 + 0.03]
         for z_grasp in zs:
+            if m == "side":
+                # the fingers slope down to their tips (SIDE_TILT from vertical): at full depth they cross the
+                # object's axis this much higher than the tips - it must still be the object's lower part
+                half = obj.length / 2 if obj.long_axis is not None else obj.radius
+                cross = z_grasp + max(0.0, seat_depth(obj) - half) * np.cos(SIDE_TILT)
+                if cross > args.side_cross_max * obj.height:
+                    tried.append(f"side at {z_grasp * 100:.1f} cm: the fingers would cross the object at "
+                                 f"{cross * 100:.1f} cm, above {args.side_cross_max:.0%} of its {obj.height * 100:.1f} cm")
+                    continue
             z_travel = travel_height(obj, obstacles, z_grasp)
             try:
                 cands = grasp_candidates(planner, ws, obj, m, obj.xy, z_grasp, z_travel)
@@ -1210,8 +1462,8 @@ def make_plan(objs: list[Obj], index: int, args: "Args", planner: AzPlanner) -> 
                         # the shuttle's preferred direction is blocked: any free direction will do
                         place = choose_place(planner, ws, obj, obj.xy, yaw, tilt, az, z_grasp, z_travel,
                                              args.place_dist, None)
-                    gap_side = TALL_JAW_GAP if safe_height(obj) > TALL_H else JAW_GAP
-                    open_grip = float(min(GRIP_OPEN, (obj.diameter + 2 * gap_side) / JAW_STROKE))
+                    gap_side = TALL_JAW_GAP if (safe_height(obj) > TALL_H or obj.xy_uncertain) else JAW_GAP
+                    open_grip = float(min(GRIP_OPEN, (obj.grip_width + 2 * gap_side) / JAW_STROKE))
                     why = reason if m == mode else f"{reason} -- BUT that failed ({tried[-1]}), fell back to '{m}'"
                     plan = Plan(obj, obstacles, m, why, yaw, tilt, az, obj.xy, place, z_grasp, z_travel, open_grip)
                     pause = args.pause if args.rescan else 0.0
@@ -1352,7 +1604,8 @@ def print_plan(plan: Plan) -> None:
     print("\nstep 3  grasp decision")
     print(f"  {'VERTICAL (top-down)' if plan.mode == 'top' else 'HORIZONTAL (side)'}: {plan.reason}")
     print(f"  fingertips close at z {plan.z_grasp * 100:.1f} cm; jaw pre-opens to "
-          f"{plan.open_grip * JAW_STROKE * 100:.1f} cm for a {plan.obj.diameter * 100:.1f} cm object")
+          f"{plan.open_grip * JAW_STROKE * 100:.1f} cm for a {plan.obj.grip_width * 100:.1f} cm "
+          f"{'short side' if plan.obj.long_axis is not None else 'object'}")
     print("\nstep 2  trajectory")
     print(f"  travel height {plan.z_travel * 100:.0f} cm, wrist yaw {np.degrees(plan.yaw):.0f} deg, tilt "
           f"{np.degrees(plan.tilt):.0f} deg, approach azimuth "
@@ -1554,7 +1807,31 @@ def view_gate(plan: Plan, planner: AzPlanner, ws: Workspace, q_start: np.ndarray
     q = np.array(q_start[:6], dtype=float)
     holding, placed = False, False
     swept, bad = [], []
+    why = {"obstacles": 0, "depth height map": 0, "target": 0, "carried object": 0}
     obst = [(np.array(o.xy), o.radius + ws.margin, o.height + 0.01) for o in plan.obstacles]
+    # the depth height map: every cell that rises above the sheet, detected as an object or not. Cells that
+    # belong to the target (inside its circle + tolerance) are left to the target test below.
+    hm = None
+    if DEPTH_WORLD.get("H") is not None:
+        import depth as _d
+        H, lo = np.nan_to_num(DEPTH_WORLD["H"], nan=0.0), DEPTH_WORLD["lo"]
+        ij = np.argwhere(H > _d.MIN_RISE)
+        cxy = lo + (ij + 0.5) * _d.CELL
+        # the target's cells: around where it IS (plan.obj.xy, the world) as well as around the pick point, which
+        # the visual check's correction moves into the arm's own frame (1.8 cm on the run that found this)
+        r_t = plan.obj.radius + TALL_TOL + 0.01
+        mine = ((np.linalg.norm(cxy - np.array(plan.pick), axis=1) < r_t) |
+                (np.linalg.norm(cxy - np.array(plan.obj.xy), axis=1) < r_t))
+        Hn = H.copy()
+        for i, j in ij[mine]:
+            Hn[i, j] = 0.0
+        # ... and every raised patch connected to the target's cells: its depth trail and front face are the
+        # target too (a 19 cm bottle's patch reached past the circle and flagged 296 arm points)
+        n_c, lab = cv2.connectedComponents((H > _d.MIN_RISE).astype(np.uint8), connectivity=8)
+        for k in set(int(lab[i, j]) for i, j in ij[mine]) - {0}:
+            Hn[lab == k] = 0.0
+        r = int(np.ceil(ws.margin / _d.CELL))  # a cell's top counts within the margin around it
+        hm = (lo, _d.CELL, cv2.dilate(Hn.astype(np.float32), np.ones((2 * r + 1, 2 * r + 1), np.uint8)))
     th = safe_height(plan.obj)
     tol = TALL_TOL if th > TALL_H else TARGET_TOL
     for wp in walk:
@@ -1570,14 +1847,22 @@ def view_gate(plan: Plan, planner: AzPlanner, ws: Workspace, q_start: np.ndarray
                 b = np.zeros(len(pts), bool)
                 for c, r, h in obst:
                     b |= (pts[:, 2] < h) & (np.linalg.norm(pts[:, :2] - c, axis=1) < r)
+                why["obstacles"] += int(b.sum())
+                if hm is not None:
+                    bh = ~tip & _below_heightmap(pts, hm)
+                    why["depth height map"] += int((bh & ~b).sum())
+                    b |= bh
                 if not holding:  # the target standing on the table (pick point, or place point once released)
                     c = np.array(plan.place if placed else plan.pick)
-                    b |= ~tip & (pts[:, 2] < th + 0.01) & (np.linalg.norm(pts[:, :2] - c, axis=1) < plan.obj.radius + tol)
+                    bt = ~tip & (pts[:, 2] < th + 0.01) & (np.linalg.norm(pts[:, :2] - c, axis=1) < plan.obj.radius + tol)
+                    why["target"] += int((bt & ~b).sum())
+                    b |= bt
                 if holding:
                     cp = carry(planner.fk_pos(qq))
                     cb = np.zeros(len(cp), bool)
                     for c, r, h in obst:
                         cb |= (cp[:, 2] < h) & (np.linalg.norm(cp[:, :2] - c, axis=1) < r)
+                    why["carried object"] += int(cb.sum())
                     pts, b = np.vstack([pts, cp]), np.r_[b, cb]
                 swept.append(pts[::3])
                 bad.append(b[::3])
@@ -1604,9 +1889,22 @@ def view_gate(plan: Plan, planner: AzPlanner, ws: Workspace, q_start: np.ndarray
         cv2.imwrite(str(CAPTURES / "fused_views.jpg"), img)
     except Exception as e:  # the picture is for people; the verdict above does not depend on it
         print(f"   (could not draw the fused views: {e})")
-    print(f"   fused-view check ({label}): " + ("clear" if ok else f"{int(bad.sum())} points inside a clearance") +
+    src = ", ".join(f"{k} {v}" for k, v in why.items() if v)
+    print(f"   fused-view check ({label}): " + ("clear" if ok else f"{int(bad.sum())} points inside a clearance ({src})") +
           " -> captures/fused_views.jpg")
     return ok
+
+
+def _below_heightmap(pts: np.ndarray, hm: tuple) -> np.ndarray:
+    """Points below the top (+1 cm) of any raised height-map cell within the margin (hm is pre-dilated)."""
+    lo, cell, Hm = hm
+    ix = np.floor((pts[:, 0] - lo[0]) / cell).astype(int)
+    iy = np.floor((pts[:, 1] - lo[1]) / cell).astype(int)
+    ok = (ix >= 0) & (ix < Hm.shape[0]) & (iy >= 0) & (iy < Hm.shape[1])
+    out = np.zeros(len(pts), bool)
+    top = Hm[ix[ok], iy[ok]]
+    out[ok] = (top > 0.012) & (pts[ok, 2] < top + 0.01)
+    return out
 
 
 def safe_park(arm: Arm, planner: AzPlanner, yaw: float, tilt: float) -> None:
@@ -1618,10 +1916,13 @@ def safe_park(arm: Arm, planner: AzPlanner, yaw: float, tilt: float) -> None:
         q = np.array(arm.last_cmd[:6], dtype=float)
         here = planner.fk_pos(q)
         steps = max(1, int(np.ceil((Z_TRAVEL_MIN - here[2]) / 0.02)))
+        lift = []
         for k in range(1, steps + 1) if here[2] < Z_TRAVEL_MIN else ():
             z = here[2] + (Z_TRAVEL_MIN - here[2]) * k / steps
             q, _, _ = planner.ik(here[0], here[1], z, q, yaw, tilt)
-            arm.glide(q, 1.5 / steps)
+            lift.append(q)
+        if lift:
+            arm.glide_path(lift, 1.5)  # one smooth lift, not a stop every 2 cm
     except RuntimeError as e:
         print(f"   (no straight lift from here: {e})")
     goto_joint(arm, planner, np.array(READY), 4.0)
@@ -1649,6 +1950,267 @@ def bail(arm: Arm, planner: AzPlanner, ws: Workspace, plan: Plan, holding: bool,
 
 
 # ==================================================================================== execution
+GRASP_TRIES = 3  # closes on nothing -> open, look again, re-centre, close again; this many closes in all
+GRASP_CENTRE_TOL = 0.008  # m: the object's centre may sit this far off the middle of the jaw before re-centring
+GRASP_CENTRE_ROUNDS = 3  # look-and-shift rounds before each close
+GRASP_STEP_DOWN = 0.004  # m the fingertips go lower after each close on nothing
+GRASP_Z_FLOOR = 0.004  # m: never below this (the model's tips; the real ones have read ~1 cm higher)
+GRASP_MAX_SHIFT = 0.025  # m: a jaw-check re-centring larger than this is not trusted
+
+
+def jaw_alignment(plan: Plan, planner: AzPlanner, arm: Arm, idx: int) -> tuple[float, float, str]:
+    """Where the object sits between the OPEN fingers, measured in the images - not through the calibration.
+
+    In every calibrated camera: the two fingers are the dark blobs near where each fingertip should be; the
+    object is what differs from the empty-zone background between them. The object's position along the line
+    from one finger to the other, t (0 = on finger A, 1 = on finger B, 0.5 = centred), times the jaw's real
+    opening, is its offset in metres - a ratio inside one image, so a camera that is off by 2 cm still
+    measures it right. Views are weighted by how long the jaw looks in them. Returns (offset along the jaw
+    direction in m, confidence 0..1, note); positive offset = towards finger B."""
+    if not FUSED_CAMS:
+        return 0.0, 0.0, "no cameras"
+    q = np.array(arm.last_cmd[:6], dtype=float)
+    tip = planner.fk_pos(arm.q())
+    keep = planner.az
+    planner.az = plan.az
+    jd = np.asarray(planner.jaw_dir(plan.pick, plan.yaw, plan.tilt, plan.az), dtype=float)
+    planner.az = keep
+    jd = jd / (np.linalg.norm(jd) + 1e-9)
+    half = plan.open_grip * JAW_STROKE / 2
+    zc = max(0.005, min(plan.z_grasp, plan.obj.height) / 2)  # look at the object's lower half
+    A = np.array([tip[0], tip[1], zc]) - half * jd
+    B = np.array([tip[0], tip[1], zc]) + half * jd
+    num, den, notes, tiles = 0.0, 0.0, [], []
+    for k, lc in FUSED_CAMS.items():
+        if k not in FUSED_MODELS:
+            continue
+        cam, f = FUSED_MODELS[k], lc.latest()
+        bg = cv2.imread(str(BACKGROUND[k]))
+        if f is None or bg is None:
+            continue
+        a, b = cam.project(np.vstack([A, B]))
+        L = float(np.linalg.norm(b - a))
+        if not np.all(np.isfinite([*a, *b])) or L < 25:
+            continue  # the jaw is end-on or off-frame in this view
+        h, w = f.shape[:2]
+        dark = cv2.cvtColor(f, cv2.COLOR_BGR2HSV)[..., 2] < 70
+        # the finger plates are wide solid blobs; a cable crossing the view is a thin line: open it away
+        dark = cv2.morphologyEx(dark.astype(np.uint8), cv2.MORPH_OPEN, np.ones((11, 11), np.uint8)) > 0
+        def blob(c):
+            m = np.zeros((h, w), bool)
+            cv2.circle(m.view(np.uint8), (int(c[0]), int(c[1])), int(max(12, 0.35 * L)), 1, -1)
+            ys, xs = np.nonzero(m & dark)
+            return None if len(xs) < 40 else np.array([xs.mean(), ys.mean()])
+        fa, fb = blob(a), blob(b)
+        if fa is None or fb is None:
+            notes.append(f"{k}: fingers not both visible")
+            continue
+        band = np.zeros((h, w), np.uint8)
+        cv2.line(band, (int(fa[0]), int(fa[1])), (int(fb[0]), int(fb[1])), 255, int(max(10, 0.5 * L)))
+        diff = table_foreground(f, bg, quiet=True) > 0  # the object, not its shadow on the sheet
+        obj = (band > 0) & diff & ~cv2.dilate(dark.astype(np.uint8), np.ones((9, 9), np.uint8)).astype(bool)
+        ys, xs = np.nonzero(obj)
+        if len(xs) < 60:
+            notes.append(f"{k}: object not visible between the fingers")
+            continue
+        o = np.array([xs.mean(), ys.mean()])
+        ab = fb - fa
+        t = float((o - fa) @ ab / (ab @ ab))
+        off = (t - 0.5) * 2 * half
+        wgt = L
+        num, den = num + wgt * off, den + wgt
+        notes.append(f"{k}: object at {t:.2f} of the jaw ({off * 100:+.1f} cm)")
+        v = f.copy()
+        v[obj] = (0.5 * v[obj] + [0, 90, 0]).astype(np.uint8)
+        for c, col in ((fa, (255, 0, 0)), (fb, (0, 0, 255)), (o, (0, 255, 0))):
+            cv2.drawMarker(v, (int(c[0]), int(c[1])), col, cv2.MARKER_CROSS, 24, 2)
+        cu, cv_ = int((fa[0] + fb[0]) / 2), int((fa[1] + fb[1]) / 2)
+        r = int(max(80, 1.3 * L))
+        tiles.append(cv2.resize(v[max(0, cv_ - r):cv_ + r, max(0, cu - r):cu + r], (320, 320)))
+    if tiles:
+        cv2.imwrite(str(CAPTURES / f"grasp_check_{idx}.jpg"), np.hstack(tiles))
+    if den == 0:
+        return 0.0, 0.0, "; ".join(notes) or "no usable view"
+    return num / den, min(1.0, den / 200.0), "; ".join(notes)
+
+
+def centre_in_jaw(plan: Plan, planner: AzPlanner, arm: Arm, ws: "Workspace", tag: str) -> None:
+    """Before closing: measure the object between the open fingers (jaw_alignment) and, while it is more than
+    GRASP_CENTRE_TOL off the middle, lift 3 cm, shift along the jaw by the measured offset, and come back down."""
+    keep = planner.az
+    planner.az = plan.az
+    jd = np.asarray(planner.jaw_dir(plan.pick, plan.yaw, plan.tilt, plan.az), dtype=float)
+    planner.az = keep
+    jd = jd / (np.linalg.norm(jd[:2]) + 1e-9)
+    for r in range(GRASP_CENTRE_ROUNDS):
+        time.sleep(0.4)  # let the cameras see the arm at rest
+        off, conf, note = jaw_alignment(plan, planner, arm, f"{tag}_{r}")
+        print(f"   jaw check: {note} -> {off * 100:+.1f} cm off centre (confidence {conf:.1f}) "
+              f"-> captures/grasp_check_{tag}_{r}.jpg")
+        if conf < 0.5 or abs(off) <= GRASP_CENTRE_TOL:
+            return
+        if abs(off) > GRASP_MAX_SHIFT:
+            print(f"   (not re-centring on a {off * 100:.1f} cm reading: larger than the check is trusted for)")
+            return
+        here = planner.fk_pos(np.array(arm.last_cmd[:6], dtype=float))
+        up = here + np.array([0, 0, 0.03])
+        to = up + np.r_[off * jd[:2], 0.0]
+        print(f"   re-centring: lift, shift {off * 100:+.1f} cm along the jaw, come back down")
+        move_line(arm, planner, ws, up, plan.yaw, plan.tilt, 1.2)
+        move_line(arm, planner, ws, to, plan.yaw, plan.tilt, 1.2)
+        move_line(arm, planner, ws, to - np.array([0, 0, 0.03]), plan.yaw, plan.tilt, 1.2)
+
+
+TOUCH_OFFSETS = (0.0, 0.015, -0.015, 0.03, -0.03)  # m along the jaw: where the touch search tries to come down
+TOUCH_STEP = 0.003  # m per step of the probing descent
+TOUCH_BLOCK = 0.006  # m: settled this far above the commanded height = a finger standing on something
+
+
+def probe_descend(arm: Arm, planner: AzPlanner, xy, z_from: float, z_to: float, yaw: float, tilt: float) -> tuple[bool, float]:
+    """One smooth descent to the grasp height, then read where the fingertips really are. Small probing steps
+    did not work: a 3 mm step is below what the joints move from standstill, so the arm stayed put and read
+    as a block at ~3 cm, every time. A finger standing on the object keeps the arm clearly above its command
+    once it has settled (7 mm on a dish, seen in the recording) while a free descent settles to within a few mm.
+    Returns (reached the target height, measured fingertip height)."""
+    q = np.array(arm.last_cmd[:6], dtype=float)
+    path = []
+    for z in np.linspace(z_from, z_to, max(2, int((z_from - z_to) / 0.01) + 1))[1:]:
+        q, _, _ = planner.ik(xy[0], xy[1], z, q, yaw, tilt)
+        path.append(q)
+    arm.glide_path(path, 1.5)
+    time.sleep(0.8)
+    zm = planner.fk_pos(arm.q())[2]
+    return zm <= z_to + TOUCH_BLOCK, float(zm)
+
+
+def touch_search(plan: Plan, planner: AzPlanner, arm: Arm) -> bool:
+    """Find, by touch, where the open fingers come down BESIDE the object instead of on it. The cameras place
+    a low object to a centimetre or two, the jaw may have millimetres to spare (a 9.0 cm dish in a 9.5 cm jaw):
+    a finger landing on it is felt as the arm stopping short, and the next spot along the jaw is tried."""
+    keep = planner.az
+    planner.az = plan.az
+    jd = np.asarray(planner.jaw_dir(plan.pick, plan.yaw, plan.tilt, plan.az), dtype=float)
+    planner.az = keep
+    jd = jd[:2] / (np.linalg.norm(jd[:2]) + 1e-9)
+    here = planner.fk_pos(np.array(arm.last_cmd[:6], dtype=float))
+    z_hover = max(here[2], plan.z_grasp + 0.03)
+    for off in TOUCH_OFFSETS:
+        xy = np.array(here[:2]) + off * jd
+        q, _, _ = planner.ik(xy[0], xy[1], z_hover, np.array(arm.last_cmd[:6], dtype=float), plan.yaw, plan.tilt)
+        arm.glide(q, 1.0)
+        ok, zm = probe_descend(arm, planner, xy, z_hover, plan.z_grasp, plan.yaw, plan.tilt)
+        print(f"   touch search {off * 100:+.1f} cm along the jaw: " +
+              (f"reached {zm * 100:.1f} cm - the fingers are beside it" if ok else
+               f"stopped at {zm * 100:.1f} cm (commanded lower): a finger is on it, lifting"))
+        if ok:
+            return True
+        q, _, _ = planner.ik(xy[0], xy[1], z_hover, np.array(arm.last_cmd[:6], dtype=float), plan.yaw, plan.tilt)
+        arm.glide(q, 0.8)
+    return False
+
+
+BRUTE_PRIOR = (-0.010, -0.014)  # m: the visual check's consistent correction on the dish runs: the grid's centre
+BRUTE_ALONG = 0.005  # m grid step along the jaw (where the object may have mm to spare)
+BRUTE_ACROSS = 0.010  # m grid step across the jaw (the fingers are wide there)
+BRUTE_RANGE = (0.040, 0.020)  # m half-extent along / across the jaw
+
+
+def brute_candidates(plan: Plan, planner: AzPlanner, centre) -> list[np.ndarray]:
+    """Every grasp spot on a jaw-aligned grid around `centre`, nearest first (across-the-jaw distance counts
+    half: the fingers are wide there, so an error across the jaw costs less)."""
+    keep = planner.az
+    planner.az = plan.az
+    jd = np.asarray(planner.jaw_dir(plan.pick, plan.yaw, plan.tilt, plan.az), dtype=float)[:2]
+    planner.az = keep
+    jd = jd / (np.linalg.norm(jd) + 1e-9)
+    pd = np.array([-jd[1], jd[0]])
+    pts = []
+    for a in np.arange(-BRUTE_RANGE[0], BRUTE_RANGE[0] + 1e-9, BRUTE_ALONG):
+        for b in np.arange(-BRUTE_RANGE[1], BRUTE_RANGE[1] + 1e-9, BRUTE_ACROSS):
+            pts.append((np.hypot(a, 0.5 * b), np.asarray(centre) + a * jd + b * pd))
+    return [p for _, p in sorted(pts, key=lambda t: t[0])]
+
+
+def brute_grasp(plan: Plan, planner: AzPlanner, arm: Arm, args: "Args", live=None) -> bool:
+    """Try grasp spots until one holds: hover, one smooth descent to the grasp height, close. Holding -> done
+    (the plan carries on from here). Closed on nothing -> open, rise, next spot. After a full grid, the object
+    is measured again (it may have been nudged) and one more round is tried."""
+    z_h = plan.z_grasp + 0.03
+    centre = np.array(plan.pick) + np.array(BRUTE_PRIOR)
+    n = 0
+    for rnd in range(2):
+        cands = brute_candidates(plan, planner, centre)
+        print(f"   brute force round {rnd + 1}: {len(cands)} spots around ({centre[0]:+.3f}, {centre[1]:+.3f}), nearest first")
+        for xy in cands:
+            n += 1
+            if live is not None:
+                live.set(phase=f"brute-force grasp: try {n} at ({xy[0]:+.3f}, {xy[1]:+.3f})")
+            try:
+                q, _, _ = planner.ik(xy[0], xy[1], z_h, np.array(arm.last_cmd[:6], dtype=float), plan.yaw, plan.tilt)
+                arm.glide(q, 0.9)
+                path, qq = [], q
+                for z in np.linspace(z_h, plan.z_grasp, 4)[1:]:
+                    qq, _, _ = planner.ik(xy[0], xy[1], z, qq, plan.yaw, plan.tilt)
+                    path.append(qq)
+                arm.glide_path(path, 1.0)
+                time.sleep(0.3)
+            except RuntimeError as e:
+                print(f"   try {n}: unreachable ({e})")
+                continue
+            if grip_on_object(arm, args):
+                print(f"   try {n} at ({xy[0]:+.3f}, {xy[1]:+.3f}): HOLDING - "
+                      f"{np.linalg.norm(xy - np.array(plan.pick)) * 100:.1f} cm from the camera estimate")
+                return True
+            print(f"   try {n} at ({xy[0]:+.3f}, {xy[1]:+.3f}): nothing - next")
+            arm.set_grip(plan.open_grip, 0.8)
+            q, _, _ = planner.ik(xy[0], xy[1], z_h, np.array(arm.last_cmd[:6], dtype=float), plan.yaw, plan.tilt)
+            arm.glide(q, 0.6)
+        if rnd == 0 and args.given:
+            print("   full grid tried: measuring the object again for a second round")
+            try:  # rise clear first so the camera sees it
+                here = planner.fk_pos(np.array(arm.last_cmd[:6], dtype=float))
+                q, _, _ = planner.ik(here[0], here[1], plan.z_travel, np.array(arm.last_cmd[:6], dtype=float), plan.yaw, plan.tilt)
+                arm.glide(q, 1.5)
+                time.sleep(0.8)
+                new = measure_disc(plan.obj.diameter / 2, plan.obj.height)
+                if new is not None:
+                    print(f"   the object is now at ({new[0]:+.3f}, {new[1]:+.3f})")
+                    centre = np.array(new) + np.array(BRUTE_PRIOR)
+            except Exception as e:
+                print(f"   (could not re-measure: {e})")
+    return False
+
+
+def measure_disc(r: float, h: float) -> tuple[float, float] | None:
+    """A flat round object's centre from the detection camera: fit a cylinder of radius r, height h to its
+    outline against the empty-zone background (rays touch the rim between the table and its top)."""
+    from scipy.optimize import least_squares
+    lc = FUSED_CAMS.get(DET)
+    if lc is None:
+        return None
+    c, f = FUSED_MODELS[DET], lc.latest()
+    bg = cv2.imread(str(BACKGROUND[DET]))
+    Z = load_zone()
+    zm = np.zeros(f.shape[:2], np.uint8)
+    cv2.fillPoly(zm, [c.project(np.c_[Z, np.zeros(len(Z))]).astype(np.int32)], 255)
+    d = cv2.absdiff(cv2.GaussianBlur(f, (5, 5), 0), cv2.GaussianBlur(bg, (5, 5), 0)).max(axis=2)
+    m = ((d > 14) & (zm > 0)).astype(np.uint8) * 255
+    m = cv2.morphologyEx(cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((15, 15), np.uint8)), cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+    cnts = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)[0]
+    if not cnts:
+        return None
+    pts = max(cnts, key=cv2.contourArea).reshape(-1, 2).astype(float)[::2]
+    rays = [c.ray(u, v) for u, v in pts]
+    def resid(pp):
+        out = []
+        for o, dv in rays:
+            zs = np.linspace(0, h, 7); sc = (zs - o[2]) / dv[2]; P = o[None] + sc[:, None] * dv[None]
+            out.append(np.min(np.abs(np.hypot(P[:, 0] - pp[0], P[:, 1] - pp[1]) - r)))
+        return np.array(out)
+    sol = least_squares(resid, np.mean([c.hit_plane(u, v, h / 2)[:2] for u, v in pts], axis=0), loss="soft_l1", f_scale=0.003)
+    return float(sol.x[0]), float(sol.x[1])
+
+
 def grip_on_object(arm: Arm, args: "Args") -> bool:
     """Close until the fingers stall on the object. True if something is actually held."""
     g = close_until_contact(arm, squeeze=args.squeeze)
@@ -1737,6 +2299,7 @@ def execute(plan: Plan, planner: AzPlanner, arm: Arm, cam: LiveCamera | None, cm
 def _run_legs(plan: Plan, planner: AzPlanner, arm: Arm, cam: LiveCamera | None, cmodel: CameraModel,
               args: "Args", live: LiveState | None, ws: Workspace, step, i: int) -> bool:
     holding, carry = False, None
+    pre_closed = False
     arm.holding = False
     ws.aim(plan.obj, plan.pick)  # in the planner's frame the object stands at the commanded pick point
     while i < len(plan.waypoints):
@@ -1756,18 +2319,54 @@ def _run_legs(plan: Plan, planner: AzPlanner, arm: Arm, cam: LiveCamera | None, 
             i += 1
             continue
         step(i, wp.label)
-        if wp.kind == "close":
+        if wp.kind == "close" and pre_closed:  # the brute-force search already closed on it
+            pre_closed = False
             holding, carry = True, carried_points(plan.obj, plan.z_grasp, grasp_ahead(planner, plan))
             arm.holding = True
             ws.aim(None)
-            if not grip_on_object(arm, args):
+        elif wp.kind == "close":
+            got = False
+            for attempt in range(1, GRASP_TRIES + 1):
+                try:  # look before closing: is the object really between the fingers?
+                    centre_in_jaw(plan, planner, arm, ws, f"{i}_{attempt}")
+                except RuntimeError as e:
+                    print(f"   (jaw check skipped: {e})")
+                if grip_on_object(arm, args):
+                    got = True
+                    break
+                if attempt < GRASP_TRIES:
+                    # the camera check fixes left-right, not height: a miss on a low object is the fingers
+                    # closing over its rim (the real tips ~1 cm above the model's). Open, step down, retry.
+                    here = planner.fk_pos(np.array(arm.last_cmd[:6], dtype=float))
+                    z_new = max(GRASP_Z_FLOOR, here[2] - GRASP_STEP_DOWN)
+                    print(f"   attempt {attempt}/{GRASP_TRIES} closed on nothing: open, step down to "
+                          f"{z_new * 100:.1f} cm, look again, retry")
+                    arm.set_grip(plan.open_grip, 1.2)
+                    if z_new < here[2] - 1e-4:
+                        try:
+                            move_line(arm, planner, ws, np.r_[here[:2], z_new], plan.yaw, plan.tilt, 1.0)
+                        except RuntimeError as e:
+                            print(f"   (cannot go lower: {e})")
+            if not got:
                 arm.holding = False
-                bail(arm, planner, ws, plan, False, "the gripper closed on nothing")
+                bail(arm, planner, ws, plan, False, f"the gripper closed on nothing ({GRASP_TRIES} attempts)")
                 return False
+            holding, carry = True, carried_points(plan.obj, plan.z_grasp, grasp_ahead(planner, plan))
+            arm.holding = True
+            ws.aim(None)
         elif wp.kind == "hold":
             time.sleep(wp.seconds)
         elif wp.kind in ("rest", "pose"):
             goto_joint(arm, planner, np.array(REST if wp.kind == "rest" else wp.q), wp.seconds)
+        elif args.brute and wp.label == "descend onto the object":
+            if not brute_grasp(plan, planner, arm, args, live):
+                bail(arm, planner, ws, plan, False, "brute force: no grasp spot held it")
+                return False
+            pre_closed = True
+        elif args.touch_search and wp.label == "descend onto the object":
+            if not touch_search(plan, planner, arm):
+                bail(arm, planner, ws, plan, False, "the touch search found no spot where the fingers come down beside it")
+                return False
         else:
             move_line(arm, planner, ws, wp.xyz, plan.yaw, plan.tilt, wp.seconds, carry, qs=wp.qs)
             if wp.settle:  # a refinement on top of a leg that already arrived: skip it if IK has no answer
@@ -1798,10 +2397,32 @@ class Args:
     background: bool = False
     """Capture captures/bg_cam*.png with an EMPTY table; re-run whenever the lighting or a camera moves."""
     given: str | None = None
-    """"x,y,diameter,height" (m): pick this object instead of a detected one - for a target the survey cannot
+    """"x,y,diameter,height" or "x,y,length,width,height,long_side_deg" (m, deg): pick this object instead of a detected one - for a target the survey cannot
     see (clear plastic on the white sheet), measured by hand from the cameras. It becomes object 0; anything
     the survey does detect is kept as an obstacle. More "x,y,d,h" after ";" are extra obstacles (the head of
     a hammer whose handle is the target); detections within 6 cm of any given object are dropped."""
+    depth: bool = True
+    """First scene analysis with Depth Anything V2 Small (depth.py): metric heights and footprints from the
+    detection camera, objects the background survey misses, and a height map the trajectory must clear."""
+    brute: bool = False
+    """Top grasp: instead of trusting the estimate, try grasp spots on a grid around it (nearest first) until
+    one holds; two rounds, re-measuring the object in between. For a Petri dish in a jaw it barely fits."""
+    touch_search: bool = False
+    """Top grasp: come down to the object in small steps and feel for a finger landing on it (the arm stopping
+    short); if so, lift and try further along the jaw. For objects the jaw only just fits (a Petri dish)."""
+    side_only: bool = False
+    """With --grasp side: never fall back to a top grasp (a horizontal pick was asked for)."""
+    max_width: float | None = None
+    """Widest object the jaw may close on (default MAX_OBJ_WIDTH, 8.5 cm, a finger margin under the 9.5 cm
+    opening); raise it only for one known object that fits (a 9.0 cm dish)."""
+    side_cross_max: float = 0.6
+    """A side grasp's fingers must cross the object's axis within this fraction of its height (a 1.5 cm dish
+    needs ~0.75: the fingertips cannot go lower than ~1 cm)."""
+    tactile: bool = False
+    """Log the gripper's tactile skin (USB serial, tactile.py) with the gripper motor's position/velocity/
+    effort at 100 Hz; saved as meta/tactile/episode_NNNNNN.csv in the dataset, plus a correlation report."""
+    tactile_port: str | None = None
+    """Serial port of the skin (default: the first /dev/cu.usbmodem*/usbserial* found)."""
     given_only: bool = False
     """With --given: use only the given objects, dropping every detection (a lying hammer's handle is detected
     as a separate short cylinder)."""
@@ -1863,6 +2484,8 @@ def look(args: Args) -> tuple[np.ndarray, CameraModel, list[Obj]]:
         if frame is None:
             raise RuntimeError(f"could not read {args.frames}")
         objs = survey(frame, cmodel, args.min_area)
+        if args.depth:
+            objs = fuse_depth(objs, frame, cmodel)
     else:  # never overwrite the file we were asked to plan from
         frames = grab_all(args)
         frame = frames[DET]
@@ -1872,6 +2495,8 @@ def look(args: Args) -> tuple[np.ndarray, CameraModel, list[Obj]]:
         cams = still_cameras(frames, cams)
         frames = {k: f for k, f in frames.items() if k in cams}
         objs = survey_multi(frames, cams, args.min_area)
+        if args.depth:
+            objs = fuse_depth(objs, frame, cams[DET], more=grab_more(DET, DEPTH_FRAMES - 1))
     objs = with_given(objs, args)
     if not objs:
         raise RuntimeError(f"nothing in the zone that is not in {BACKGROUND[DET].name} - either it is "
@@ -1883,9 +2508,18 @@ def with_given(objs: list[Obj], args: "Args") -> list[Obj]:
     """--given prepended as object 0; a detection within 6 cm of it is the same object and dropped."""
     if not args.given:
         return objs
-    given = [tuple(float(v) for v in part.split(",")) for part in args.given.split(";") if part.strip()]
-    out = [Obj("given" if i == 0 else f"given_obstacle{i}", (x, y), d, h, (230, 230, 230), measured=True)
-           for i, (x, y, d, h) in enumerate(given)]
+    out = []
+    for i, part in enumerate(p for p in args.given.split(";") if p.strip()):
+        v = [float(t) for t in part.split(",")]
+        name = "given" if i == 0 else f"given_obstacle{i}"
+        if len(v) == 6:  # x, y, length, width, height, long-side angle (deg)
+            x, y, L, W, H, adeg = v
+            L, W = max(L, W), min(L, W)
+            out.append(Obj(name, (x, y), L, H, (230, 230, 230), measured=True,
+                           length=L, width=W, angle=float(np.radians(adeg)), dims_from="measured by hand"))
+        else:
+            x, y, d, h = v
+            out.append(Obj(name, (x, y), d, h, (230, 230, 230), measured=True, dims_from="measured by hand (round)"))
     if args.given_only:
         if objs:
             print(f"   (--given-only: ignoring {len(objs)} detection(s) - they are parts of the given objects)")
@@ -1946,7 +2580,12 @@ def stage_scene(args: Args) -> None:
     cams = load_cameras()
     raw = json.loads((HERE / "cameras.json").read_text())
     frames = grab_all(args)
-    objs = survey_multi(frames, cams, args.min_area)
+    # the world from the cameras that are still where they were calibrated (a moved cam2 carved a 6 cm
+    # bottle into a 24 x 8 cm slab), refined by the depth analysis; every camera is still drawn
+    still = still_cameras(frames, cams)
+    objs = survey_multi({k: f for k, f in frames.items() if k in still}, still, args.min_area)
+    if args.depth and DET in still:
+        objs = fuse_depth(objs, frames[DET], still[DET], more=grab_more(DET, DEPTH_FRAMES - 1))
     for o in objs:
         print(f"   {o.describe()}")
     meshes = []  # live_map.build poses the arm itself; scene.json only needs the q
@@ -1955,20 +2594,26 @@ def stage_scene(args: Args) -> None:
         "frame": "robot base: x forward, y left, z up, table z=0 (m)",
         "cameras": [camera_entry(k, cams[k], frames[k], raw[k]) for k in sorted(cams)],
         "objects": [{"name": o.name, "axis": list(o.xy), "diameter": o.diameter, "height": o.height,
-                     "color": list(o.color)} for o in objs],
+                     "color": list(o.color), "dims": o.dims_from} for o in objs],
         "robot": {"q": [0.0] * 6, "tcp": [0.0, 0.0, 0.0], "meshes": meshes},
-        "calibration_points": [r["fk"] for d in ("sweep_zone2", "sweep_zone3")
+        "calibration_points": [r["fk"] for d in ("sweep_zone2", "sweep_zone3", "sweep_zone6")
+                               if (CAPTURES / d / "sweep.json").exists()
                                for r in json.loads((CAPTURES / d / "sweep.json").read_text())],
     }
     zone = load_zone()
     if zone is not None:
         from fused import TopView, jpeg_b64
-        tv = TopView(cams, zone)
+        tv = TopView(still, zone)
         top = tv.annotate(tv.render(frames), zone, scene["objects"])
         cv2.imwrite(str(CAPTURES / "fused_top.jpg"), top)
         scene["top"] = {"b64": jpeg_b64(top), "meta": tv.meta()}
     (HERE / "scene.json").write_text(json.dumps(scene))
     print(f"wrote scene.json: {len(scene['cameras'])} cameras, {len(objs)} object(s)")
+    try:  # the sensors panel and the depth world (camera and serial reads only)
+        import map_world
+        map_world.build()
+    except Exception as e:
+        print(f"   (sensors/world report skipped: {e})")
     live_map.build(HERE / "scene.json")
 
 
@@ -1999,11 +2644,30 @@ def stage_survey(args: Args) -> None:
         print(f"[{i}] {o.describe()}\n     {verdict}")
 
 
+MIN_TARGET_H = 0.025  # m: lower than this is a cable end, a sheet or a shadow, not the thing to pick
+
+
+def choose_target(objs: list[Obj], args: Args) -> int:
+    """--object 0 with several objects and nothing hand-measured: the thing the person put there, i.e. the
+    largest object the jaw can close on - not whatever the survey listed first (a cable end hanging into the
+    zone, 3 cm tall, once took the place of a 19 cm bottle). The rest stay obstacles."""
+    if args.object != 0 or args.given or len(objs) < 2:
+        return args.object
+    ok = [i for i, o in enumerate(objs) if o.height >= MIN_TARGET_H and o.grip_width <= MAX_OBJ_WIDTH]
+    if not ok:
+        return 0
+    i = max(ok, key=lambda k: objs[k].height * objs[k].diameter ** 2)
+    if i != 0:
+        print(f"   target: {objs[i].name} (the largest graspable object; "
+              f"{', '.join(o.name for k, o in enumerate(objs) if k != i)} kept as obstacles)")
+    return i
+
+
 def plan_from_frame(frame: np.ndarray, cmodel: CameraModel, objs: list[Obj], args: Args) -> Plan:
     if not 0 <= args.object < len(objs):
         raise RuntimeError(f"--object {args.object} out of range: {len(objs)} object(s) found")
     print(f"{len(objs)} object(s) on the table")
-    plan = make_plan(objs, args.object, args, AzPlanner())
+    plan = make_plan(objs, choose_target(objs, args), args, AzPlanner())
     print_plan(plan)
     draw_plan(frame, cmodel, plan, CAPTURES / "plan.jpg")
     (HERE / "plan.json").write_text(json.dumps(plan.to_json(), indent=2))
@@ -2066,6 +2730,12 @@ def stage_run(args: Args) -> None:
                 if k != DET:
                     cv2.imwrite(str(CAPTURES / f"survey_{k}.jpg"), f)
             objs = survey_multi(frames, models, args.min_area, ignore=masks)
+            if args.depth:
+                more = []
+                for _ in range(DEPTH_FRAMES - 1):
+                    time.sleep(0.35)
+                    more.append(cams[DET].latest())
+                objs = fuse_depth(objs, frames[DET], models[DET], ignore=masks.get(DET), more=more)
             FUSED_CAMS.update({k: cams[k] for k in models if k in cams})
             FUSED_MODELS.update(models)
             zone = load_zone()
@@ -2093,6 +2763,19 @@ def stage_run(args: Args) -> None:
         rec = EpisodeRecorder(Path(args.record), cams, arm.state7, lambda: arm.last_cmd, args.task, args.fps)
         rec.start()
         print(f"recording to {args.record} at {args.fps} fps")
+    grip_log = skin = None
+    if args.tactile:  # the gripper's skin next to its motor, on one clock (tactile.py)
+        from tactile import GripLog, TactileSkin
+        try:
+            skin = TactileSkin(args.tactile_port)
+            skin.tare()  # the jaw is open and touching nothing yet
+            grip_log = GripLog(skin, arm.robot.get_observations, lambda: float(arm.last_cmd[6]),
+                               lambda: str(live.doc.get("phase", "")))
+            grip_log.start()
+            print(f"tactile skin on {skin.port}: {skin.width} channels, logging with the gripper motor")
+        except Exception as e:  # the pick does not depend on the skin
+            print(f"!! tactile skin not logged: {e}")
+            skin = grip_log = None
     live.get_q7 = arm.state7
     live.set(status="running", phase="starting")
     live.start()
@@ -2110,6 +2793,17 @@ def stage_run(args: Args) -> None:
         live.stop("done" if ok else "aborted")
         if rec:
             rec.stop()
+        if grip_log:
+            grip_log.stop()
+            where = (Path(args.record) / "meta" / "tactile" / f"episode_{rec.ep:06d}.csv" if rec
+                     else CAPTURES / "tactile" / f"{live.doc.get('run', 'run')}.csv")
+            try:
+                print(f"saved skin + gripper motor log: {grip_log.save(where)} ({len(grip_log.rows)} samples)")
+                from tactile import report
+                report(where, where.with_suffix(".png"))
+            except Exception as e:
+                print(f"!! could not save the tactile log: {e}")
+            skin.close()
         arm.close()
         for lc in cams.values():
             lc.close()
@@ -2126,7 +2820,9 @@ def stage_run(args: Args) -> None:
 
 
 def main(args: Args) -> None:
-    global JAW_ACROSS
+    global JAW_ACROSS, MAX_OBJ_WIDTH
+    if args.max_width is not None:
+        MAX_OBJ_WIDTH = min(float(args.max_width), JAW_STROKE - 0.003)
     if args.jaw_across:
         v = np.array([float(t) for t in args.jaw_across.split(",")])
         JAW_ACROSS = v / np.linalg.norm(v)

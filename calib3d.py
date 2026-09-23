@@ -71,7 +71,8 @@ class Args:
 
 
 # ------------------------------------------------------------------------------------------- detection
-def wedge_tip(a: np.ndarray, b: np.ndarray, c: np.ndarray, a2: np.ndarray | None = None, dark: int = 70, min_area: float = 300.0):
+def wedge_tip(a: np.ndarray, b: np.ndarray, c: np.ndarray, a2: np.ndarray | None = None, dark: int = 70, min_area: float = 300.0,
+              near: tuple[float, float] | None = None):
     """Pixel of the closed fingertip: lowest rows of the biggest blob that is dark in b but not in a or c.
     With a second open frame a2 (taken shortly after a), anything that already changed between a and a2
     (people moving in the background) is rejected too."""
@@ -87,7 +88,11 @@ def wedge_tip(a: np.ndarray, b: np.ndarray, c: np.ndarray, a2: np.ndarray | None
     cnts = [k for k in cnts if cv2.contourArea(k) >= min_area]
     if not cnts:
         return None, m
-    big = max(cnts, key=cv2.contourArea)
+    if near is None:
+        big = max(cnts, key=cv2.contourArea)
+    else:  # the blob whose tip (lowest point) is nearest where the tips are expected: a cable riding on the
+        # finger also darkens when the jaw closes, and it can be the bigger blob
+        big = min(cnts, key=lambda k: float(np.hypot(*(k[k[:, 0, 1].argmax(), 0] - np.array(near)))))
     keep = np.zeros_like(m)
     cv2.drawContours(keep, [big], -1, 255, -1)
     vs, us = np.where(keep > 0)

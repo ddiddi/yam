@@ -307,13 +307,38 @@ class Arm:
         self.robot.command_joint_pos(cmd)
 
     def glide(self, q_to: np.ndarray, seconds: float) -> None:
-        q_from = self.q()
-        steps = max(1, int(seconds * self.hz))
-        for i in range(steps + 1):
-            a = i / steps
-            a = 0.5 - 0.5 * np.cos(np.pi * a)  # ease in/out
-            self._cmd((1 - a) * q_from + a * q_to)
-            time.sleep(seconds / steps)
+        self.glide_path([q_to], seconds)
+
+    def glide_path(self, qs: list, seconds: float) -> None:
+        """One continuous, minimum-jerk motion through joint waypoints `qs` (from the measured joints).
+
+        A leg used to be a chain of 2 cm glides, each easing in and out - the arm stopped every 2 cm, and
+        the cosine ease starts and ends with a jump in acceleration. Now the waypoints are joined by a C2
+        cubic spline over joint-space arc length, and travelled with the minimum-jerk time law
+        s = 10t^3 - 15t^4 + 6t^5: velocity and acceleration are zero at both ends and continuous in between.
+        Commands go out on an absolute clock, so the timing does not drift."""
+        Q = np.vstack([self.q()] + [np.asarray(q, dtype=float)[:6] for q in qs])
+        d = np.r_[0.0, np.cumsum(np.linalg.norm(np.diff(Q, axis=0), axis=1))]
+        keep = np.r_[True, np.diff(d) > 1e-6]  # repeated waypoints would break the spline
+        Q, d = Q[keep], d[keep]
+        if len(Q) == 1:
+            return
+        u = d / d[-1]
+        if len(Q) == 2:
+            path = lambda s: Q[0] + (Q[1] - Q[0]) * s
+        else:
+            from scipy.interpolate import CubicSpline
+            spl = CubicSpline(u, Q, axis=0, bc_type="natural")
+            path = lambda s: spl(s)
+        steps = max(2, int(seconds * self.hz))
+        t0 = time.monotonic()
+        for i in range(1, steps + 1):
+            tau = i / steps
+            s_ = tau ** 3 * (10 - 15 * tau + 6 * tau ** 2)  # minimum jerk
+            self._cmd(path(s_))
+            wait = t0 + i * seconds / steps - time.monotonic()
+            if wait > 0:
+                time.sleep(wait)
 
     def set_grip(self, g: float, seconds: float = 1.5) -> None:
         q6 = np.array(self.last_cmd[:6], dtype=float)  # hold the commanded pose, not the sagging measured one
@@ -337,13 +362,15 @@ def move_cartesian(
     p0 = planner.fk_pos(q)
     p1 = np.array([x, y, z])
     n = max(1, int(np.linalg.norm(p1 - p0) / step))
-    for i in range(1, n + 1):
+    qs = []
+    for i in range(1, n + 1):  # every step solved and checked BEFORE moving, then one smooth motion
         p = p0 + (p1 - p0) * i / n
         q_next, _, _ = planner.ik(p[0], p[1], p[2], q, yaw, tilt)
         if not planner.path_is_safe(q, q_next):
             raise RuntimeError(f"unsafe segment towards {p}")
-        arm.glide(q_next, seconds / n)
+        qs.append(q_next)
         q = q_next
+    arm.glide_path(qs, seconds)
     return q
 
 
@@ -470,6 +497,11 @@ def blink_and_locate(arm: Arm, cam: LiveCamera, roi=(100, 0, 1150, 720)) -> tupl
     return uv, a, b
 
 
+SERVO_WIN = 170  # px: half-size of the window the blink is searched in, around the calibrated expectation
+SERVO_MAX_FK = 0.03  # m: largest believable gap between the seen fingertips and the arm's own FK
+SERVO_MAX_SPREAD = 0.015  # m: the visual check's blinks must agree on that gap to within this
+
+
 def visual_correct_3d(
     arm: Arm, planner: Planner, cam: LiveCamera, target: np.ndarray, yaw: float, tilt: float, z_check: float, max_iter: int = 3,
     cam_key: str = "cam0", offset: float = SERVO_OFFSET, direction: np.ndarray | None = None,
@@ -483,6 +515,7 @@ def visual_correct_3d(
     d /= np.linalg.norm(d)  # towards the camera (or the given direction), in the table plane
     desired = target + offset * d  # where the tips should be seen, fixed for the whole loop
     corr = np.zeros(2)  # accumulated (actual - commanded) offset of the real arm
+    fk_offsets = []
     for it in range(max_iter):
         check = desired - corr
         move_cartesian(arm, planner, check[0], check[1], z_check, yaw, tilt, 2.0)
@@ -498,12 +531,16 @@ def visual_correct_3d(
         # frame a person walking behind or another robot's LEDs won (a 0.52 m "error", zone batch)
         eu, ev = c0.project(believed[None])[0]
         H, W = a.shape[:2]
-        x0, x1 = int(np.clip(eu - 170, 0, W)), int(np.clip(eu + 170, 0, W))
-        y0, y1 = int(np.clip(ev - 170, 0, H)), int(np.clip(ev + 170, 0, H))
+        # the blob nearest the expectation, not the biggest: the tactile skin's cable can ride on the finger
+        # and darken when the jaw closes too (it won 6 of 21 sweep blinks, off by up to 150 px, while the model
+        # was within ~15 px). The window stays wide: the finger wedge is ~200 px tall, and a blob touching the
+        # window edge is rejected, so +-100 px threw the real fingertips away. A wrong pick is caught below.
+        x0, x1 = int(np.clip(eu - SERVO_WIN, 0, W)), int(np.clip(eu + SERVO_WIN, 0, W))
+        y0, y1 = int(np.clip(ev - SERVO_WIN, 0, H)), int(np.clip(ev + SERVO_WIN, 0, H))
         uv = None
         if x1 - x0 > 40 and y1 - y0 > 40:
             crop = lambda f: f[y0:y1, x0:x1]
-            uv, _ = wedge_tip(crop(a), crop(b), crop(c), crop(a2))
+            uv, _ = wedge_tip(crop(a), crop(b), crop(c), crop(a2), near=(eu - x0, ev - y0))
             if uv is not None:
                 uv = (uv[0] + x0, uv[1] + y0)
         dbg = b.copy()
@@ -520,6 +557,16 @@ def visual_correct_3d(
               f"  (FK offset {np.round(actual - believed[:2], 3)})")
         if np.linalg.norm(err) > 0.08:
             raise RuntimeError(f"visual check: implausible {np.linalg.norm(err):.3f} m error, aborting")
+        fk_offsets.append(actual - believed[:2])
+        spread = max(np.linalg.norm(a - b) for a in fk_offsets for b in fk_offsets)
+        if spread > SERVO_MAX_SPREAD:
+            # the arm's model offset is a property of the arm: blinks that disagree by more than this saw
+            # different things (from a new camera angle, readings jumped +1.8 / -1.9 cm and the grasp missed)
+            raise RuntimeError(f"visual check: its readings disagree by {spread * 100:.1f} cm - not correcting on them")
+        if np.linalg.norm(actual - believed[:2]) > SERVO_MAX_FK:
+            # the arm's model and cam 1 agree to ~1.5 cm (sweep_zone6): a bigger gap is something else blinking
+            raise RuntimeError(f"visual check: the 'fingertips' were seen {np.linalg.norm(actual - believed[:2]) * 100:.1f} cm "
+                               f"from where the arm is - a misdetection (a cable on the finger?), not correcting on it")
         corr += err
         if np.linalg.norm(err) < SERVO_TOL:
             break

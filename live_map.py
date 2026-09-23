@@ -152,6 +152,9 @@ def build(scene_path: Path = HERE / "scene.json", out: Path = PAGE) -> Path:
         "zone": json.loads((HERE / "zone.json").read_text())["polygon"] if (HERE / "zone.json").exists() else [],
         # what the page shows until (or without) a live update
         "top_meta": scene.get("top", {}).get("meta"),
+        # sensors + the depth world (map_world.py): cameras' drift, depth fit, the skin, the height map
+        **(json.loads((HERE / "captures" / "map_world.json").read_text())
+           if (HERE / "captures" / "map_world.json").exists() else {}),
         "initial": {"top": scene.get("top", {}).get("b64"), "status": "idle", "phase": "", "steps": [], "step": -1, "q": q7, "poses": poses, "tcp": tcp,
                     "trail": [], "path": [], "updated": 0,
                     "objects": [{"name": o["name"], "axis": o["axis"], "diameter": o["diameter"],

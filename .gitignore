@@ -14,3 +14,6 @@ i2rt/
 # generated pages (rebuilt by live_map.py / build_viewer.py)
 workspace_map.html
 scene_viewer.html
+
+# large model weights (depth.py downloads instructions in its docstring)
+models/*.onnx

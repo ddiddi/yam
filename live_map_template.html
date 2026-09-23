@@ -4,17 +4,17 @@
 :root{
   --bg:#eef0f3; --panel:#ffffff; --panel2:#f6f7f9; --ink:#1b2027; --muted:#5d6672; --line:#d7dbe1;
   --cam0:#1e8f8f; --cam1:#d4891c; --obj:#b8409f; --robot:#3a3f47; --good:#2f8a4c; --warn:#b8741b;
-  --grid:#c9ced6; --table:#d9c9b0; --sky:#eef0f3; --target:#2f6fd6; --cam2:#6b4fc8;
+  --grid:#c9ced6; --table:#d9c9b0; --sky:#eef0f3; --target:#2f6fd6; --cam2:#6b4fc8; --depth:#c7412f; --bad:#c0392b;
   --sans:"IBM Plex Sans",system-ui,-apple-system,"Segoe UI",sans-serif; --mono:"IBM Plex Mono",ui-monospace,Menlo,Consolas,monospace;
 }
 @media (prefers-color-scheme: dark){ :root:not([data-theme="light"]){
   --bg:#151a20; --panel:#1d232b; --panel2:#232a33; --ink:#e6e9ee; --muted:#98a2ae; --line:#303845;
   --cam0:#3fb8b8; --cam1:#e9a03a; --obj:#d76ac1; --robot:#c7cdd6; --good:#5cbf78; --warn:#e2a24a;
-  --grid:#2c343f; --table:#4a4235; --sky:#151a20; --target:#6aa0f0; --cam2:#a08cf0; }}
+  --grid:#2c343f; --table:#4a4235; --sky:#151a20; --target:#6aa0f0; --cam2:#a08cf0; --depth:#ff806e; --bad:#ff7b6b; }}
 :root[data-theme="dark"]{
   --bg:#151a20; --panel:#1d232b; --panel2:#232a33; --ink:#e6e9ee; --muted:#98a2ae; --line:#303845;
   --cam0:#3fb8b8; --cam1:#e9a03a; --obj:#d76ac1; --robot:#c7cdd6; --good:#5cbf78; --warn:#e2a24a;
-  --grid:#2c343f; --table:#4a4235; --sky:#151a20; --target:#6aa0f0; --cam2:#a08cf0; }
+  --grid:#2c343f; --table:#4a4235; --sky:#151a20; --target:#6aa0f0; --cam2:#a08cf0; --depth:#ff806e; --bad:#ff7b6b; }
 html,body{height:100%}
 body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);font-size:14px;line-height:1.45}
 .app{display:grid;grid-template-columns:320px 1fr;grid-template-rows:auto 1fr;height:100%;min-height:0}
@@ -59,6 +59,9 @@ section h2{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:va
 .steps li.now{background:var(--panel);border:1px solid var(--line);color:var(--ink);font-weight:600}
 .steps li.now::before{content:"▶ ";color:var(--warn)}
 .vtitle{position:absolute;font-size:11px;font-weight:600;letter-spacing:.04em;padding:2px 8px;border-radius:0 0 6px 0;background:var(--panel);border:1px solid var(--line);color:var(--muted);pointer-events:none}
+.stat{font-family:var(--mono);font-size:11px;padding:1px 6px;border-radius:999px;border:1px solid var(--line);margin-left:auto}
+.stat.good{color:var(--good)} .stat.warn{color:var(--warn)} .stat.bad{color:var(--bad)}
+.ramp{height:8px;border-radius:4px;background:linear-gradient(90deg,#30123b,#4686fb,#1ae4b6,#a2fc3c,#fabb39,#e4460a,#7a0403);margin:6px 0 2px}
 .vframe{position:absolute;border:1px solid var(--line);pointer-events:none}
 @media (prefers-reduced-motion: reduce){ *{animation:none!important;transition:none!important} }
 </style>
@@ -93,6 +96,14 @@ section h2{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:va
       <div id="objects"></div>
     </section>
     <section>
+      <h2>Sensors</h2>
+      <div id="sensors"></div>
+    </section>
+    <section>
+      <h2>World · depth <label class="chk"><input type="checkbox" id="showDepth" checked> height map</label></h2>
+      <div id="world"></div>
+    </section>
+    <section>
       <h2>Cameras <label class="chk"><input type="checkbox" id="showImages" checked> image planes</label></h2>
       <div id="cameras"></div>
     </section>
@@ -112,6 +123,8 @@ section h2{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:va
       <span><i class="sw" style="background:#fff;border:1px solid var(--target)"></i>work zone</span>
       <span><i class="sw" style="background:var(--warn)"></i>planned path</span>
       <span><i class="sw" style="background:var(--good)"></i>fingertip trail</span>
+      <span><i class="sw" style="background:linear-gradient(90deg,#4686fb,#a2fc3c,#e4460a)"></i>depth height map</span>
+      <span><i class="sw" style="background:transparent;border:1.5px solid var(--depth)"></i>depth-measured box</span>
     </div>
     <div class="hint">drag · orbit &nbsp; wheel · zoom &nbsp; right-drag · pan</div>
   </main>
@@ -207,6 +220,76 @@ if ((S.zone || []).length > 2) {
   const shape = new THREE.Shape(S.zone.map(p => new THREE.Vector2(p[0], p[1])));
   const zm = new THREE.Mesh(new THREE.ShapeGeometry(shape), new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.55 }));
   zm.position.z = 0.0008; scene.add(zm);
+}
+
+// ---------------------------------------------------------------- sensors + the depth world
+const SE = S.sensors || {}, W = S.world || null;
+const stat = (txt, cls) => `<span class="stat ${cls}">${txt}</span>`;
+(function sensorsPanel() {
+  const el = $('sensors'); if (!el) return;
+  const cards = [];
+  (SE.cameras || []).forEach(c => {
+    const cls = c.status === 'calibrated' ? 'good' : c.status === 'offline' ? 'bad' : 'warn';
+    cards.push(`<div class="card"><div class="name"><i class="sw" style="background:var(--${c.name})"></i>${c.name}${stat(c.status.split(' - ')[0], cls)}</div>
+      <dl class="kv"><dt>role</dt><dd>${c.role || '—'}</dd><dt>drift</dt><dd>${c.shift_px != null ? c.shift_px + ' px since calibration' : '—'}</dd>
+      <dt>frame</dt><dd>${c.resolution || '—'}</dd></dl>${c.status.includes('moved') ? '<p class="note">Left out of every calculation until it is recalibrated (marker board).</p>' : ''}</div>`);
+  });
+  const d = SE.depth;
+  if (d) cards.push(`<div class="card"><div class="name">${d.name}${stat('metric', 'good')}</div>
+      <dl class="kv"><dt>runs on</dt><dd>${d.camera} · ${d.runtime} · ${d.inference_s} s</dd>
+      <dt>table fit</dt><dd>${d.table_fit_rms_mm} mm rms (bow ${d.table_bow_mm} mm removed)</dd>
+      <dt>height map</dt><dd>${d.cells} cells of ${W ? (W.cell * 1000).toFixed(0) : 5} mm</dd></dl>
+      <p class="note">Relative depth pinned to the calibrated table plane. Heights ±1 cm; extent along the camera's line of sight ±2–3 cm.</p></div>`);
+  const k = SE.skin;
+  if (k) {
+    const g = k.last_grasp;
+    cards.push(`<div class="card"><div class="name">${k.name}${stat(k.status === 'streaming' ? 'streaming' : k.status.split(' (')[0], k.status === 'streaming' ? 'good' : 'warn')}</div>
+      <dl class="kv"><dt>board</dt><dd>${k.board}${k.port ? ' · ' + k.port.replace('/dev/', '') : ''}</dd>
+      ${k.channels ? `<dt>signal</dt><dd>${k.channels} ch · ${k.rate_hz} Hz · ${k.layout}</dd>` : ''}
+      ${g ? `<dt>skin ~ motor effort</dt><dd>r = ${g.r_skin_effort_gripping} while gripping</dd>
+      <dt>skin ~ opening</dt><dd>r = ${g.r_skin_opening_closing} while closing</dd>
+      <dt>half-level</dt><dd>motor ${g.motor_squeeze_s} s · skin ${g.skin_contact_s} s</dd>` : ''}</dl>
+      ${g ? `<p class="note">Last grasp: ${g.log.split('/').slice(-4).join('/')}</p>` : ''}</div>`);
+  }
+  const a = SE.arm;
+  if (a && a.name) cards.push(`<div class="card"><div class="name">${a.name}${stat('calibrated', 'good')}</div>
+      <dl class="kv"><dt>fingertip model</dt><dd>${a.fingertip_model_px} px median vs cam1 (${a.sweep_points} pts, ${a.sweep})</dd></dl>
+      <p class="note">${a.note}</p></div>`);
+  el.innerHTML = cards.join('') || '<p class="note">No sensor report.</p>';
+})();
+
+const depthGroup = new THREE.Group(); scene.add(depthGroup);
+const turbo = t => { const s = [[48,18,59],[70,134,251],[26,228,182],[162,252,60],[250,187,57],[228,70,10],[122,4,3]];
+  t = Math.min(Math.max(t, 0), 1) * (s.length - 1); const i = Math.min(Math.floor(t), s.length - 2), f = t - i;
+  return new THREE.Color(...s[i].map((v, k) => (v + (s[i + 1][k] - v) * f) / 255)); };
+if (W) {
+  const cells = [];
+  W.H_mm.forEach((row, i) => row.forEach((h, j) => { if (h != null && h >= 8) cells.push([i, j, h]); }));
+  const top = Math.max(150, ...cells.map(c => c[2]));
+  if (cells.length) {
+    const box = new THREE.BoxGeometry(W.cell * 0.92, W.cell * 0.92, 1);
+    const im = new THREE.InstancedMesh(box, new THREE.MeshStandardMaterial({ roughness: 0.8, transparent: true, opacity: 0.9 }), cells.length);
+    const m4 = new THREE.Matrix4();
+    cells.forEach(([i, j, h], n) => {
+      const z = h / 1000;
+      m4.makeScale(1, 1, z).setPosition(W.lo[0] + (i + 0.5) * W.cell, W.lo[1] + (j + 0.5) * W.cell, z / 2);
+      im.setMatrixAt(n, m4); im.setColorAt(n, turbo(h / top));
+    });
+    depthGroup.add(im);
+  }
+  (W.objects || []).forEach((o, n) => {
+    const g = new THREE.EdgesGeometry(new THREE.BoxGeometry(o.length, o.width, Math.max(o.height, 0.005)));
+    const e = new THREE.LineSegments(g, new THREE.LineBasicMaterial({ color: col('--depth') }));
+    e.rotation.z = o.angle; e.position.set(o.xy[0], o.xy[1], o.height / 2); depthGroup.add(e);
+  });
+  const wEl = $('world');
+  const objs = (W.objects || []).map((o, n) => `<div class="card"><div class="name"><i class="sw" style="background:transparent;border:1.5px solid var(--depth)"></i>depth object ${n}${stat(o.shape || 'measured', 'good')}</div>
+      <dl class="kv"><dt>centre (x, y)</dt><dd>${f3(o.xy)} m</dd><dt>L × W × H</dt><dd>${cm(o.length)} × ${cm(o.width)} × ${cm(o.height)}</dd>
+      <dt>long side</dt><dd>${(o.angle * 180 / Math.PI).toFixed(0)}° in the robot frame</dd></dl></div>`).join('');
+  wEl.innerHTML = `<div class="ramp"></div><div class="note" style="display:flex;justify-content:space-between"><span>0</span><span>${(top / 10).toFixed(0)} cm</span></div>
+    <p class="note">Measured ${W.measured}. Cells rising ${W.min_rise_mm} mm+ above the sheet are objects; every planned path must clear them.</p>` +
+    (objs || '<p class="note">Nothing rises above the sheet.</p>');
+  $('showDepth').addEventListener('change', e => { depthGroup.visible = e.target.checked; render(); });
 }
 
 // the fused top view (every calibrated camera re-projected onto the table plane), draped on the table
