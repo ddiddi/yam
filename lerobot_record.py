@@ -29,8 +29,9 @@ class LiveCamera:
     """Continuously grabs frames on a thread so recording never stalls the control loop."""
 
     def __init__(self, index: int, width: int = 1280, height: int = 720):
+        from scene3d import device_index
         self.index = index
-        self.cap = cv2.VideoCapture(index)
+        self.cap = cv2.VideoCapture(device_index(index))
         if not self.cap.isOpened():
             raise RuntimeError(f"camera {index} did not open")
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)

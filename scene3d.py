@@ -41,8 +41,17 @@ class Args:
     out: str = "scene.json"
 
 
+
+def device_index(index: int) -> int:
+    """The OS camera index for a calibrated camera number. USB replugs renumber the cameras; set
+    YAM_CAM_MAP="1:2,2:1" (calibrated:device) instead of recalibrating when they merely swapped."""
+    import os
+    m = dict(tuple(int(v) for v in kv.split(":")) for kv in os.environ.get("YAM_CAM_MAP", "").split(",") if ":" in kv)
+    return m.get(int(index), int(index))
+
+
 def grab(index: int) -> np.ndarray:
-    cap = cv2.VideoCapture(index)
+    cap = cv2.VideoCapture(device_index(index))
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
     t0 = time.time()

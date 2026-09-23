@@ -2458,7 +2458,16 @@ def do_pour(arm: Arm, planner: AzPlanner, ws: "Workspace", plan: Plan, args: "Ar
     arm.glide_path([q_lift], 3.0)  # back to the lift pose
 
 
+HOLD_SPEED = 1.0  # --soft: the arm never moves faster than this while it holds the object (a 2x lift dropped the dish)
+
+
 def secure_hold(arm: Arm, planner: AzPlanner, plan: Plan, args: "Args") -> None:
+    arm.speed_free = getattr(arm, "speed", 1.0)  # restored at the release
+    arm.speed = min(arm.speed_free, HOLD_SPEED)
+    _secure_hold(arm, planner, plan, args)
+
+
+def _secure_hold(arm: Arm, planner: AzPlanner, plan: Plan, args: "Args") -> None:
     """After a soft close: lift 5 mm and read the gripper motor load. Still loaded (the object's weight and the
     hold are on the fingers) -> carry on. Load gone, or the skin lost most of its pressure -> it is slipping:
     set it back down and raise the held load by 0.05 (never past 3x the first target)."""
@@ -2706,9 +2715,20 @@ def _run_legs(plan: Plan, planner: AzPlanner, arm: Arm, cam: LiveCamera | None, 
                     print(f"   fingertips at {np.round(pos, 3)}")
                 except RuntimeError as e:
                     print(f"   (sag compensation skipped: {e})")
+            if wp.grip is not None and (wp.release or wp.grip >= GRIP_OPEN - 1e-6) and holding and args.soft:
+                from pick_bottle import load
+                e, free = load(arm, 10), getattr(arm, "free_load", 0.0)
+                if e < free + 0.03:
+                    print(f"!! at the place point the gripper load is {e:.2f} (free {free:.2f}): the object is not in "
+                          "the jaw - it was dropped on the way")
+                    arm.speed = getattr(arm, "speed_free", arm.speed)
+                    bail(arm, planner, ws, plan, False, "the object was dropped between the pick and the place point")
+                    return False
+                print(f"   still holding at the place point: load {e:.2f} (free {free:.2f})")
             if wp.grip is not None:
                 arm.set_grip(wp.grip, 1.5)
                 if (wp.release or wp.grip >= GRIP_OPEN - 1e-6) and holding:
+                    arm.speed = getattr(arm, "speed_free", arm.speed)
                     holding, carry = False, None
                     arm.holding = False
                     ws.aim(plan.obj, plan.place)
