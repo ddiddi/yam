@@ -1,0 +1,262 @@
+<title>YAM Workspace Map</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+:root{
+  --bg:#eef0f3; --panel:#ffffff; --panel2:#f6f7f9; --ink:#1b2027; --muted:#5d6672; --line:#d7dbe1;
+  --cam0:#1e8f8f; --cam1:#d4891c; --obj:#b8409f; --robot:#3a3f47; --good:#2f8a4c; --warn:#b8741b;
+  --grid:#c9ced6; --table:#d9c9b0; --sky:#eef0f3;
+  --sans:"IBM Plex Sans",system-ui,-apple-system,"Segoe UI",sans-serif; --mono:"IBM Plex Mono",ui-monospace,Menlo,Consolas,monospace;
+}
+@media (prefers-color-scheme: dark){ :root:not([data-theme="light"]){
+  --bg:#151a20; --panel:#1d232b; --panel2:#232a33; --ink:#e6e9ee; --muted:#98a2ae; --line:#303845;
+  --cam0:#3fb8b8; --cam1:#e9a03a; --obj:#d76ac1; --robot:#c7cdd6; --good:#5cbf78; --warn:#e2a24a;
+  --grid:#2c343f; --table:#4a4235; --sky:#151a20; }}
+:root[data-theme="dark"]{
+  --bg:#151a20; --panel:#1d232b; --panel2:#232a33; --ink:#e6e9ee; --muted:#98a2ae; --line:#303845;
+  --cam0:#3fb8b8; --cam1:#e9a03a; --obj:#d76ac1; --robot:#c7cdd6; --good:#5cbf78; --warn:#e2a24a;
+  --grid:#2c343f; --table:#4a4235; --sky:#151a20; }
+html,body{height:100%}
+body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);font-size:14px;line-height:1.45}
+.app{display:grid;grid-template-columns:320px 1fr;grid-template-rows:auto 1fr;height:100%;min-height:0}
+header{grid-column:1/-1;display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;padding:10px 16px;border-bottom:1px solid var(--line);background:var(--panel)}
+header h1{font-size:16px;font-weight:600;margin:0;letter-spacing:.01em}
+header .frame{font-family:var(--mono);font-size:12px;color:var(--muted)}
+aside{overflow:auto;border-right:1px solid var(--line);background:var(--panel);padding:12px 16px 24px;display:flex;flex-direction:column;gap:18px}
+main{position:relative;min-width:0;min-height:320px;background:var(--sky)}
+canvas{display:block;width:100%;height:100%;outline:none}
+.legend{position:absolute;left:12px;top:10px;display:flex;gap:10px;flex-wrap:wrap;font-size:12px;pointer-events:none}
+.legend span{display:inline-flex;align-items:center;gap:6px;background:var(--panel);border:1px solid var(--line);padding:2px 8px;border-radius:999px}
+.sw{width:10px;height:10px;border-radius:2px;display:inline-block}
+.hint{position:absolute;right:12px;bottom:10px;font-size:12px;color:var(--muted);background:var(--panel);border:1px solid var(--line);padding:4px 8px;border-radius:6px}
+.labels{position:absolute;inset:0;pointer-events:none;overflow:hidden}
+.lbl{position:absolute;transform:translate(-50%,-130%);font-family:var(--mono);font-size:11px;padding:1px 6px;border-radius:4px;background:var(--panel);border:1px solid var(--line);white-space:nowrap}
+section h2{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin:0 0 8px;font-weight:600;display:flex;justify-content:space-between;align-items:center}
+.card{border:1px solid var(--line);border-radius:8px;padding:10px 12px;background:var(--panel2);display:grid;gap:4px}
+.card+.card{margin-top:8px}
+.card .name{font-weight:600;display:flex;align-items:center;gap:8px}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:2px 10px;font-family:var(--mono);font-size:12px;font-variant-numeric:tabular-nums}
+.kv dt{color:var(--muted);margin:0}
+.kv dd{margin:0}
+.thumb{width:100%;border-radius:4px;border:1px solid var(--line);cursor:pointer;display:block;max-width:100%}
+.thumb.off{opacity:.45}
+.chk{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);text-transform:none;letter-spacing:0;font-weight:500}
+.chk input{margin:0}
+.q{display:grid;grid-template-columns:repeat(7,1fr);gap:4px;font-family:var(--mono);font-size:11px;text-align:center}
+.q div{background:var(--panel);border:1px solid var(--line);border-radius:4px;padding:3px 0}
+.q small{display:block;color:var(--muted)}
+.note{font-size:12px;color:var(--muted)}
+.rms{font-size:11px;padding:1px 6px;border-radius:999px;border:1px solid currentColor;margin-left:auto}
+@media (max-width:760px){
+  .app{grid-template-columns:1fr;grid-template-rows:auto minmax(320px,55vh) 1fr;height:auto}
+  main{order:1;min-height:320px} aside{order:2;border-right:0;border-top:1px solid var(--line)}
+}
+@media (prefers-reduced-motion: reduce){ *{animation:none!important;transition:none!important} }
+</style>
+
+<div class="app">
+  <header>
+    <h1>YAM Workspace Map</h1>
+    <span class="frame" id="frame"></span>
+    <span class="frame" id="generated" style="margin-left:auto"></span>
+  </header>
+  <aside>
+    <section>
+      <h2>Cameras <label class="chk"><input type="checkbox" id="showImages" checked> image planes</label></h2>
+      <div id="cameras"></div>
+    </section>
+    <section>
+      <h2>Objects on the table</h2>
+      <div id="objects"></div>
+    </section>
+    <section>
+      <h2>Robot</h2>
+      <div class="card">
+        <div class="name">YAM · joint state (deg)</div>
+        <div class="q" id="joints"></div>
+        <dl class="kv" id="tcp"></dl>
+      </div>
+    </section>
+    <section>
+      <h2>Calibration <label class="chk"><input type="checkbox" id="showCal"> sweep points</label></h2>
+      <p class="note" id="calnote"></p>
+    </section>
+  </aside>
+  <main id="main">
+    <canvas id="c"></canvas>
+    <div class="labels" id="labels"></div>
+    <div class="legend">
+      <span><i class="sw" style="background:var(--cam0)"></i>cam 0</span>
+      <span><i class="sw" style="background:var(--cam1)"></i>cam 1</span>
+      <span><i class="sw" style="background:var(--obj)"></i>objects</span>
+      <span><i class="sw" style="background:var(--robot)"></i>robot · TCP</span>
+    </div>
+    <div class="hint">drag · orbit &nbsp; wheel · zoom &nbsp; right-drag · pan</div>
+  </main>
+</div>
+
+<script id="scene" type="application/json">/*SCENE_JSON*/</script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+const S = JSON.parse(document.getElementById('scene').textContent);
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const col = n => new THREE.Color(css(n));
+const f3 = v => v.map(x => (x >= 0 ? ' ' : '') + x.toFixed(3)).join(' ');
+const cm = v => (v * 100).toFixed(1) + ' cm';
+
+document.getElementById('frame').textContent = S.frame;
+document.getElementById('generated').textContent = 'captured ' + S.generated;
+
+// ---------------------------------------------------------------- sidebar
+const camsEl = document.getElementById('cameras');
+S.cameras.forEach((c, i) => {
+  const d = document.createElement('div'); d.className = 'card';
+  const rmsCls = c.rms_px < 8 ? 'good' : 'warn';
+  d.innerHTML = `<div class="name"><i class="sw" style="background:var(--cam${i})"></i>${c.name}
+      <span class="rms" style="color:var(--${rmsCls})">${c.rms_px.toFixed(1)} px rms · ${c.n_points} pts</span></div>
+    <img class="thumb" id="thumb${i}" alt="${c.name} view" src="data:image/jpeg;base64,${c.image_jpeg_b64}">
+    <dl class="kv">
+      <dt>position</dt><dd>${f3(c.center)} m</dd>
+      <dt>focal</dt><dd>${c.K[0][0].toFixed(0)} px · ${c.fov_deg.toFixed(0)}° HFOV</dd>
+      <dt>principal</dt><dd>(${c.K[0][2].toFixed(0)}, ${c.K[1][2].toFixed(0)}) · ${c.size[0]}×${c.size[1]}</dd>
+      <dt>distortion</dt><dd>k1 ${c.dist[0].toFixed(3)}</dd>
+    </dl>`;
+  camsEl.appendChild(d);
+});
+const objsEl = document.getElementById('objects');
+if (!S.objects.length) objsEl.innerHTML = '<p class="note">Nothing on the table in this capture.</p>';
+S.objects.forEach(o => {
+  const d = document.createElement('div'); d.className = 'card';
+  d.innerHTML = `<div class="name"><i class="sw" style="background:rgb(${o.color.join(',')});border:1px solid var(--line)"></i>${o.name}</div>
+    <dl class="kv">
+      <dt>axis (x, y)</dt><dd>${f3(o.axis)} m</dd>
+      <dt>diameter</dt><dd>${cm(o.diameter)}</dd>
+      <dt>height</dt><dd>${cm(o.height)}</dd>
+      ${o.cap_xyz ? `<dt>cap (2-view)</dt><dd>${f3(o.cap_xyz)} m</dd><dt>ray gap</dt><dd>${cm(o.cap_ray_gap)}</dd>` : ''}
+      <dt>reach</dt><dd>${Math.hypot(o.axis[0], o.axis[1]).toFixed(3)} m from base</dd>
+    </dl>`;
+  objsEl.appendChild(d);
+});
+const jEl = document.getElementById('joints');
+S.robot.q.forEach((v, i) => { const d = document.createElement('div'); d.innerHTML = `${(v * 180 / Math.PI).toFixed(0)}<small>j${i + 1}</small>`; jEl.appendChild(d); });
+{ const d = document.createElement('div'); d.innerHTML = `—<small>grip</small>`; jEl.appendChild(d); }
+document.getElementById('tcp').innerHTML = `<dt>fingertips</dt><dd>${f3(S.robot.tcp)} m</dd>`;
+document.getElementById('calnote').textContent = `${S.calibration_points.length} fingertip positions from the arm's FK, blinked at both cameras; each camera's intrinsics, distortion and pose were solved from where they appeared.`;
+
+// ---------------------------------------------------------------- three.js scene
+const canvas = document.getElementById('c'), main = document.getElementById('main');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(45, 1, 0.01, 20);
+camera.up.set(0, 0, 1);
+const target = new THREE.Vector3(0.3, -0.1, 0.05);
+let sph = { r: 1.35, theta: -0.9, phi: 1.05 };
+function placeCam() {
+  camera.position.set(target.x + sph.r * Math.sin(sph.phi) * Math.cos(sph.theta), target.y + sph.r * Math.sin(sph.phi) * Math.sin(sph.theta), target.z + sph.r * Math.cos(sph.phi));
+  camera.lookAt(target);
+}
+scene.add(new THREE.HemisphereLight(0xffffff, 0x445566, 0.9));
+const sun = new THREE.DirectionalLight(0xffffff, 0.7); sun.position.set(0.5, -0.8, 1.2); scene.add(sun);
+
+// table + grid (z up)
+const tableMat = new THREE.MeshStandardMaterial({ color: col('--table'), roughness: 0.95 });
+const table = new THREE.Mesh(new THREE.PlaneGeometry(1.3, 1.0), tableMat); table.position.set(0.35, 0, -0.001); scene.add(table);
+const grid = new THREE.GridHelper(1.3, 13, col('--grid'), col('--grid')); grid.rotation.x = Math.PI / 2; grid.position.set(0.35, 0, 0.0005); scene.add(grid);
+scene.add(new THREE.AxesHelper(0.15));
+
+// robot
+const robotMat = new THREE.MeshStandardMaterial({ color: col('--robot'), roughness: 0.6, metalness: 0.15 });
+const tipMat = new THREE.MeshStandardMaterial({ color: 0x8fb8d8, roughness: 0.5 });
+S.robot.meshes.forEach(m => {
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(m.vertices, 3));
+  g.setIndex(m.faces); g.computeVertexNormals();
+  scene.add(new THREE.Mesh(g, m.body.startsWith('tip') ? tipMat : robotMat));
+});
+const tcp = new THREE.Mesh(new THREE.SphereGeometry(0.006, 16, 12), new THREE.MeshBasicMaterial({ color: col('--good') }));
+tcp.position.fromArray(S.robot.tcp); scene.add(tcp);
+
+// cameras: frusta + image planes
+const camColors = ['--cam0', '--cam1'];
+const imagePlanes = [];
+S.cameras.forEach((c, i) => {
+  const C = new THREE.Vector3().fromArray(c.center), color = col(camColors[i]);
+  const depth = 0.35;
+  const corners = c.corner_dirs.map(d => C.clone().add(new THREE.Vector3().fromArray(d).multiplyScalar(depth)));
+  const pts = [];
+  corners.forEach(k => pts.push(C, k));
+  for (let k = 0; k < 4; k++) pts.push(corners[k], corners[(k + 1) % 4]);
+  scene.add(new THREE.LineSegments(new THREE.BufferGeometry().setFromPoints(pts), new THREE.LineBasicMaterial({ color })));
+  const body = new THREE.Mesh(new THREE.BoxGeometry(0.03, 0.03, 0.03), new THREE.MeshStandardMaterial({ color })); body.position.copy(C); scene.add(body);
+  // textured plane on the far end of the frustum (corner order: (0,0),(w,0),(w,h),(0,h))
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(corners.flatMap(p => [p.x, p.y, p.z]), 3));
+  g.setAttribute('uv', new THREE.Float32BufferAttribute([0, 1, 1, 1, 1, 0, 0, 0], 2));
+  g.setIndex([0, 1, 2, 0, 2, 3]); g.computeVertexNormals();
+  const tex = new THREE.TextureLoader().load('data:image/jpeg;base64,' + c.image_jpeg_b64);
+  const plane = new THREE.Mesh(g, new THREE.MeshBasicMaterial({ map: tex, side: THREE.DoubleSide, transparent: true, opacity: 0.85 }));
+  scene.add(plane); imagePlanes.push(plane);
+  const th = document.getElementById('thumb' + i);
+  th.addEventListener('click', () => { plane.visible = !plane.visible; th.classList.toggle('off', !plane.visible); });
+});
+document.getElementById('showImages').addEventListener('change', e => imagePlanes.forEach((p, i) => { p.visible = e.target.checked; document.getElementById('thumb' + i).classList.toggle('off', !e.target.checked); }));
+
+// objects
+const labelDefs = [];
+S.objects.forEach(o => {
+  const h = Math.max(o.height, 0.01);
+  const m = new THREE.Mesh(new THREE.CylinderGeometry(o.diameter / 2, o.diameter / 2, h, 32), new THREE.MeshStandardMaterial({ color: col('--obj'), transparent: true, opacity: 0.75, roughness: 0.7 }));
+  m.rotation.x = Math.PI / 2; m.position.set(o.axis[0], o.axis[1], h / 2); scene.add(m);
+  if (o.cap_xyz) { const s = new THREE.Mesh(new THREE.SphereGeometry(0.012, 16, 12), new THREE.MeshStandardMaterial({ color: 0xff8c1a })); s.position.fromArray(o.cap_xyz); scene.add(s); }
+  labelDefs.push({ pos: new THREE.Vector3(o.axis[0], o.axis[1], h + 0.02), text: `${o.name} · ${cm(o.diameter)} × ${cm(o.height)}` });
+});
+S.cameras.forEach((c, i) => labelDefs.push({ pos: new THREE.Vector3().fromArray(c.center).add(new THREE.Vector3(0, 0, 0.03)), text: c.name }));
+labelDefs.push({ pos: new THREE.Vector3(0, 0, 0.02), text: 'base' });
+
+// calibration points
+const calGroup = new THREE.Group(); calGroup.visible = false; scene.add(calGroup);
+const calGeom = new THREE.SphereGeometry(0.004, 8, 6), calMat = new THREE.MeshBasicMaterial({ color: col('--muted') });
+S.calibration_points.forEach(p => { const s = new THREE.Mesh(calGeom, calMat); s.position.fromArray(p); calGroup.add(s); });
+document.getElementById('showCal').addEventListener('change', e => calGroup.visible = e.target.checked);
+
+// labels overlay
+const labelsEl = document.getElementById('labels');
+const labelNodes = labelDefs.map(d => { const n = document.createElement('div'); n.className = 'lbl'; n.textContent = d.text; labelsEl.appendChild(n); return n; });
+function updateLabels() {
+  const w = main.clientWidth, h = main.clientHeight;
+  labelDefs.forEach((d, i) => {
+    const p = d.pos.clone().project(camera);
+    const vis = p.z < 1 && Math.abs(p.x) < 1.1 && Math.abs(p.y) < 1.1;
+    labelNodes[i].hidden = !vis;
+    labelNodes[i].style.left = ((p.x + 1) / 2 * w) + 'px'; labelNodes[i].style.top = ((1 - p.y) / 2 * h) + 'px';
+  });
+}
+
+// controls: orbit / zoom / pan
+let drag = null;
+canvas.addEventListener('pointerdown', e => { drag = { x: e.clientX, y: e.clientY, b: e.button }; canvas.setPointerCapture(e.pointerId); });
+canvas.addEventListener('pointerup', () => drag = null);
+canvas.addEventListener('contextmenu', e => e.preventDefault());
+canvas.addEventListener('pointermove', e => {
+  if (!drag) return;
+  const dx = e.clientX - drag.x, dy = e.clientY - drag.y; drag.x = e.clientX; drag.y = e.clientY;
+  if (drag.b === 2 || e.shiftKey) {
+    const right = new THREE.Vector3().crossVectors(camera.getWorldDirection(new THREE.Vector3()), camera.up).normalize();
+    target.addScaledVector(right, -dx * 0.0015 * sph.r).addScaledVector(camera.up, dy * 0.0015 * sph.r);
+  } else { sph.theta -= dx * 0.006; sph.phi = Math.min(Math.PI - 0.05, Math.max(0.05, sph.phi - dy * 0.006)); }
+  placeCam(); render();
+});
+canvas.addEventListener('wheel', e => { e.preventDefault(); sph.r = Math.min(5, Math.max(0.2, sph.r * Math.exp(e.deltaY * 0.001))); placeCam(); render(); }, { passive: false });
+let pinch = null;
+canvas.addEventListener('touchmove', e => { if (e.touches.length === 2) { const d = Math.hypot(e.touches[0].clientX - e.touches[1].clientX, e.touches[0].clientY - e.touches[1].clientY); if (pinch) { sph.r = Math.min(5, Math.max(0.2, sph.r * pinch / d)); placeCam(); render(); } pinch = d; e.preventDefault(); } }, { passive: false });
+canvas.addEventListener('touchend', () => pinch = null);
+
+function resize() {
+  const w = main.clientWidth, h = main.clientHeight;
+  renderer.setSize(w, h, false); camera.aspect = w / h; camera.updateProjectionMatrix(); render();
+}
+function render() { renderer.setClearColor(col('--sky')); renderer.render(scene, camera); updateLabels(); }
+new ResizeObserver(resize).observe(main);
+matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => { tableMat.color = col('--table'); render(); });
+placeCam(); resize();
+</script>

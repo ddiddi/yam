@@ -1,0 +1,9 @@
+{
+ "dictionary": "DICT_4X4_50",
+ "squares": [
+  7,
+  5
+ ],
+ "square_mm": 30.0,
+ "marker_mm": 22.0
+}

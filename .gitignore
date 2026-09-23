@@ -1,0 +1,16 @@
+# environment / caches
+.venv/
+__pycache__/
+*.pyc
+.build-constraints.txt
+
+# data: recorded datasets and camera captures (GBs)
+datasets/
+captures/
+
+# the i2rt driver is its own git checkout (github.com/i2rt-robotics/i2rt)
+i2rt/
+
+# generated pages (rebuilt by live_map.py / build_viewer.py)
+workspace_map.html
+scene_viewer.html

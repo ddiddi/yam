@@ -1,0 +1,390 @@
+<title>YAM Workspace Map</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+:root{
+  --bg:#eef0f3; --panel:#ffffff; --panel2:#f6f7f9; --ink:#1b2027; --muted:#5d6672; --line:#d7dbe1;
+  --cam0:#1e8f8f; --cam1:#d4891c; --obj:#b8409f; --robot:#3a3f47; --good:#2f8a4c; --warn:#b8741b;
+  --grid:#c9ced6; --table:#d9c9b0; --sky:#eef0f3; --target:#2f6fd6; --cam2:#6b4fc8;
+  --sans:"IBM Plex Sans",system-ui,-apple-system,"Segoe UI",sans-serif; --mono:"IBM Plex Mono",ui-monospace,Menlo,Consolas,monospace;
+}
+@media (prefers-color-scheme: dark){ :root:not([data-theme="light"]){
+  --bg:#151a20; --panel:#1d232b; --panel2:#232a33; --ink:#e6e9ee; --muted:#98a2ae; --line:#303845;
+  --cam0:#3fb8b8; --cam1:#e9a03a; --obj:#d76ac1; --robot:#c7cdd6; --good:#5cbf78; --warn:#e2a24a;
+  --grid:#2c343f; --table:#4a4235; --sky:#151a20; --target:#6aa0f0; --cam2:#a08cf0; }}
+:root[data-theme="dark"]{
+  --bg:#151a20; --panel:#1d232b; --panel2:#232a33; --ink:#e6e9ee; --muted:#98a2ae; --line:#303845;
+  --cam0:#3fb8b8; --cam1:#e9a03a; --obj:#d76ac1; --robot:#c7cdd6; --good:#5cbf78; --warn:#e2a24a;
+  --grid:#2c343f; --table:#4a4235; --sky:#151a20; --target:#6aa0f0; --cam2:#a08cf0; }
+html,body{height:100%}
+body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);font-size:14px;line-height:1.45}
+.app{display:grid;grid-template-columns:320px 1fr;grid-template-rows:auto 1fr;height:100%;min-height:0}
+header{grid-column:1/-1;display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;padding:10px 16px;border-bottom:1px solid var(--line);background:var(--panel)}
+header h1{font-size:16px;font-weight:600;margin:0;letter-spacing:.01em}
+header .frame{font-family:var(--mono);font-size:12px;color:var(--muted)}
+aside{overflow:auto;border-right:1px solid var(--line);background:var(--panel);padding:12px 16px 24px;display:flex;flex-direction:column;gap:18px}
+main{position:relative;min-width:0;min-height:320px;background:var(--sky)}
+canvas{display:block;width:100%;height:100%;outline:none}
+.legend{position:absolute;left:12px;top:10px;display:flex;gap:10px;flex-wrap:wrap;font-size:12px;pointer-events:none}
+.legend span{display:inline-flex;align-items:center;gap:6px;background:var(--panel);border:1px solid var(--line);padding:2px 8px;border-radius:999px}
+.sw{width:10px;height:10px;border-radius:2px;display:inline-block}
+.hint{position:absolute;left:12px;bottom:10px;font-size:12px;color:var(--muted);background:var(--panel);border:1px solid var(--line);padding:4px 8px;border-radius:6px}
+.labels{position:absolute;inset:0;pointer-events:none;overflow:hidden}
+.lbl{position:absolute;transform:translate(-50%,-130%);font-family:var(--mono);font-size:11px;padding:1px 6px;border-radius:4px;background:var(--panel);border:1px solid var(--line);white-space:nowrap}
+section h2{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin:0 0 8px;font-weight:600;display:flex;justify-content:space-between;align-items:center}
+.card{border:1px solid var(--line);border-radius:8px;padding:10px 12px;background:var(--panel2);display:grid;gap:4px}
+.card+.card{margin-top:8px}
+.card .name{font-weight:600;display:flex;align-items:center;gap:8px}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:2px 10px;font-family:var(--mono);font-size:12px;font-variant-numeric:tabular-nums}
+.kv dt{color:var(--muted);margin:0}
+.kv dd{margin:0}
+.thumb{width:100%;border-radius:4px;border:1px solid var(--line);cursor:pointer;display:block;max-width:100%}
+.thumb.off{opacity:.45}
+.chk{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);text-transform:none;letter-spacing:0;font-weight:500}
+.chk input{margin:0}
+.q{display:grid;grid-template-columns:repeat(7,1fr);gap:4px;font-family:var(--mono);font-size:11px;text-align:center}
+.q div{background:var(--panel);border:1px solid var(--line);border-radius:4px;padding:3px 0}
+.q small{display:block;color:var(--muted)}
+.note{font-size:12px;color:var(--muted)}
+.rms{font-size:11px;padding:1px 6px;border-radius:999px;border:1px solid currentColor;margin-left:auto}
+@media (max-width:760px){
+  .app{grid-template-columns:1fr;grid-template-rows:auto minmax(320px,55vh) 1fr;height:auto}
+  main{order:1;min-height:320px} aside{order:2;border-right:0;border-top:1px solid var(--line)}
+}
+.pill{font-family:var(--mono);font-size:11px;padding:1px 8px;border-radius:999px;border:1px solid currentColor}
+.pill.live{color:var(--good)} .pill.idle{color:var(--muted)} .pill.stale,.pill.aborted{color:var(--warn)} .pill.done{color:var(--cam0)}
+.phase{font-weight:600;font-size:15px;margin:2px 0 6px}
+.steps{list-style:none;margin:0;padding:0;display:grid;gap:2px;font-size:12px;max-height:260px;overflow:auto}
+.steps li{padding:2px 8px;border-radius:4px;color:var(--muted)}
+.steps li.done{color:var(--ink)} .steps li.done::before{content:"✓ ";color:var(--good)}
+.steps li.now{background:var(--panel);border:1px solid var(--line);color:var(--ink);font-weight:600}
+.steps li.now::before{content:"▶ ";color:var(--warn)}
+.vtitle{position:absolute;font-size:11px;font-weight:600;letter-spacing:.04em;padding:2px 8px;border-radius:0 0 6px 0;background:var(--panel);border:1px solid var(--line);color:var(--muted);pointer-events:none}
+.vframe{position:absolute;border:1px solid var(--line);pointer-events:none}
+@media (prefers-reduced-motion: reduce){ *{animation:none!important;transition:none!important} }
+</style>
+
+<div class="app">
+  <header>
+    <h1>YAM Workspace Map</h1>
+    <span class="pill idle" id="pill">idle</span>
+    <span class="frame" id="frame"></span>
+    <span class="frame" id="generated" style="margin-left:auto"></span>
+  </header>
+  <aside>
+    <section>
+      <h2>Run <span class="frame" id="updated"></span></h2>
+      <div class="card">
+        <div class="phase" id="phase">No run in progress</div>
+        <dl class="kv" id="grasp"></dl>
+        <ol class="steps" id="steps"></ol>
+        <p class="note" id="livenote"></p>
+      </div>
+    </section>
+    <section>
+      <h2>Robot</h2>
+      <div class="card">
+        <div class="name">YAM · joint state (deg)</div>
+        <div class="q" id="joints"></div>
+        <dl class="kv" id="tcp"></dl>
+      </div>
+    </section>
+    <section>
+      <h2>Objects on the table</h2>
+      <div id="objects"></div>
+    </section>
+    <section>
+      <h2>Cameras <label class="chk"><input type="checkbox" id="showImages" checked> image planes</label></h2>
+      <div id="cameras"></div>
+    </section>
+    <section>
+      <h2>Calibration <label class="chk"><input type="checkbox" id="showCal"> sweep points</label></h2>
+      <p class="note" id="calnote"></p>
+    </section>
+  </aside>
+  <main id="main">
+    <canvas id="c"></canvas>
+    <div class="labels" id="labels"></div>
+    <div id="vtitles"></div>
+    <div class="legend">
+      <span id="camlegend" style="display:contents"></span>
+      <span><i class="sw" style="background:var(--obj)"></i>obstacles</span>
+      <span><i class="sw" style="background:var(--target)"></i>target</span>
+      <span><i class="sw" style="background:#fff;border:1px solid var(--target)"></i>work zone</span>
+      <span><i class="sw" style="background:var(--warn)"></i>planned path</span>
+      <span><i class="sw" style="background:var(--good)"></i>fingertip trail</span>
+    </div>
+    <div class="hint">drag · orbit &nbsp; wheel · zoom &nbsp; right-drag · pan</div>
+  </main>
+</div>
+
+<script id="scene" type="application/json">/*SCENE_JSON*/</script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+const S = JSON.parse(document.getElementById('scene').textContent);
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const col = n => new THREE.Color(css(n));
+const f3 = v => v.map(x => (x >= 0 ? ' ' : '') + x.toFixed(3)).join(' ');
+const cm = v => (v * 100).toFixed(1) + ' cm';
+const $ = id => document.getElementById(id);
+$('frame').textContent = S.frame;
+$('generated').textContent = 'cameras ' + S.generated;
+
+// ---------------------------------------------------------------- static sidebar
+S.cameras.forEach((c, i) => {
+  const d = document.createElement('div'); d.className = 'card';
+  const rmsCls = c.rms_px < 8 ? 'good' : 'warn';
+  d.innerHTML = `<div class="name"><i class="sw" style="background:var(--${c.name})"></i>${c.name}
+      <span class="rms" style="color:var(--${rmsCls})">${c.rms_px.toFixed(1)} px rms · ${c.n_points} pts</span></div>
+    <img class="thumb" id="thumb${i}" alt="${c.name} view" src="data:image/jpeg;base64,${c.image_jpeg_b64}">
+    <dl class="kv"><dt>position</dt><dd>${f3(c.center)} m</dd><dt>focal</dt><dd>${c.K[0][0].toFixed(0)} px · ${c.fov_deg.toFixed(0)}° HFOV</dd></dl>`;
+  $('cameras').appendChild(d);
+});
+document.getElementById('camlegend').innerHTML = S.cameras.map(c => `<span><i class="sw" style="background:var(--${c.name})"></i>${c.name}</span>`).join('');
+$('calnote').textContent = `${S.calibration_points.length} fingertip positions from the arm's FK, blinked at both cameras; each camera's intrinsics, distortion and pose were solved from where they appeared.`;
+
+// ---------------------------------------------------------------- three.js scene
+const canvas = $('c'), main = $('main');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(45, 1, 0.01, 20);
+camera.up.set(0, 0, 1);
+const target = new THREE.Vector3(0.25, -0.1, 0.08);
+let sph = { r: 1.25, theta: -0.9, phi: 1.05 };
+function placeCam() {
+  camera.position.set(target.x + sph.r * Math.sin(sph.phi) * Math.cos(sph.theta), target.y + sph.r * Math.sin(sph.phi) * Math.sin(sph.theta), target.z + sph.r * Math.cos(sph.phi));
+  camera.lookAt(target);
+}
+scene.add(new THREE.HemisphereLight(0xffffff, 0x445566, 0.9));
+const sun = new THREE.DirectionalLight(0xffffff, 0.7); sun.position.set(0.5, -0.8, 1.2); scene.add(sun);
+const tableMat = new THREE.MeshStandardMaterial({ color: col('--table'), roughness: 0.95 });
+const table = new THREE.Mesh(new THREE.PlaneGeometry(1.3, 1.0), tableMat); table.position.set(0.35, 0, -0.001); scene.add(table);
+const grid = new THREE.GridHelper(1.3, 13, col('--grid'), col('--grid')); grid.rotation.x = Math.PI / 2; grid.position.set(0.35, 0, 0.0005); scene.add(grid);
+scene.add(new THREE.AxesHelper(0.15));
+
+// arm: every mesh in its own geom frame, posed by the live state
+const robotMat = new THREE.MeshStandardMaterial({ color: col('--robot'), roughness: 0.6, metalness: 0.15 });
+const tipMat = new THREE.MeshStandardMaterial({ color: 0x8fb8d8, roughness: 0.5 });
+const armMeshes = S.robot.geoms.map(g => {
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(g.vertices, 3));
+  geo.setIndex(g.faces); geo.computeVertexNormals();
+  const m = new THREE.Mesh(geo, g.body.startsWith('tip') ? tipMat : robotMat);
+  m.matrixAutoUpdate = false; scene.add(m); return m;
+});
+const tcpDot = new THREE.Mesh(new THREE.SphereGeometry(0.007, 16, 12), new THREE.MeshBasicMaterial({ color: col('--good') }));
+scene.add(tcpDot);
+
+// cameras: frusta + image planes
+const imagePlanes = [];
+S.cameras.forEach((c, i) => {
+  const C = new THREE.Vector3().fromArray(c.center), color = col('--' + c.name);
+  const corners = c.corner_dirs.map(d => C.clone().add(new THREE.Vector3().fromArray(d).multiplyScalar(0.35)));
+  const pts = []; corners.forEach(k => pts.push(C, k));
+  for (let k = 0; k < 4; k++) pts.push(corners[k], corners[(k + 1) % 4]);
+  scene.add(new THREE.LineSegments(new THREE.BufferGeometry().setFromPoints(pts), new THREE.LineBasicMaterial({ color })));
+  const body = new THREE.Mesh(new THREE.BoxGeometry(0.03, 0.03, 0.03), new THREE.MeshStandardMaterial({ color })); body.position.copy(C); scene.add(body);
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(corners.flatMap(p => [p.x, p.y, p.z]), 3));
+  g.setAttribute('uv', new THREE.Float32BufferAttribute([0, 1, 1, 1, 1, 0, 0, 0], 2));
+  g.setIndex([0, 1, 2, 0, 2, 3]);
+  const tex = new THREE.TextureLoader().load('data:image/jpeg;base64,' + c.image_jpeg_b64, () => render());
+  const plane = new THREE.Mesh(g, new THREE.MeshBasicMaterial({ map: tex, side: THREE.DoubleSide, transparent: true, opacity: 0.85 }));
+  scene.add(plane); imagePlanes.push(plane);
+  $('thumb' + i).addEventListener('click', () => { plane.visible = !plane.visible; $('thumb' + i).classList.toggle('off', !plane.visible); render(); });
+});
+$('showImages').addEventListener('change', e => { imagePlanes.forEach((p, i) => { p.visible = e.target.checked; $('thumb' + i).classList.toggle('off', !e.target.checked); }); render(); });
+
+const calGroup = new THREE.Group(); calGroup.visible = false; scene.add(calGroup);
+const calGeom = new THREE.SphereGeometry(0.004, 8, 6), calMat = new THREE.MeshBasicMaterial({ color: col('--muted') });
+S.calibration_points.forEach(p => { const s = new THREE.Mesh(calGeom, calMat); s.position.fromArray(p); calGroup.add(s); });
+$('showCal').addEventListener('change', e => { calGroup.visible = e.target.checked; render(); });
+
+// the taped workspace zone
+if ((S.zone || []).length > 2) {
+  const zpts = S.zone.concat([S.zone[0]]).map(p => new THREE.Vector3(p[0], p[1], 0.003));
+  scene.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(zpts), new THREE.LineBasicMaterial({ color: col('--target') })));
+  const shape = new THREE.Shape(S.zone.map(p => new THREE.Vector2(p[0], p[1])));
+  const zm = new THREE.Mesh(new THREE.ShapeGeometry(shape), new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.55 }));
+  zm.position.z = 0.0008; scene.add(zm);
+}
+
+// the fused top view (every calibrated camera re-projected onto the table plane), draped on the table
+let topMesh = null, topLast = null;
+function setTop(b64) {
+  if (!b64 || !S.top_meta || b64 === topLast) return;
+  topLast = b64;
+  new THREE.TextureLoader().load('data:image/jpeg;base64,' + b64, tex => {
+    if (!topMesh) {
+      const g = new THREE.BufferGeometry();
+      g.setAttribute('position', new THREE.Float32BufferAttribute(S.top_meta.corners.flatMap(p => [p[0], p[1], 0.0015]), 3));
+      g.setAttribute('uv', new THREE.Float32BufferAttribute([0, 1, 1, 1, 1, 0, 0, 0], 2));
+      g.setIndex([0, 1, 2, 0, 2, 3]);
+      topMesh = new THREE.Mesh(g, new THREE.MeshBasicMaterial({ map: tex, side: THREE.DoubleSide }));
+      scene.add(topMesh);
+    } else { topMesh.material.map.dispose(); topMesh.material.map = tex; topMesh.material.needsUpdate = true; }
+    render();
+  });
+}
+
+// orthographic views of the same fused model: top (with the homography image), side (x-z), isometric
+const ctr = new THREE.Vector3(0.24, -0.1, 0.18);
+function ortho(pos, up) { const c = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.01, 10); c.up.copy(up); c.position.copy(pos); c.lookAt(pos.x === ctr.x && pos.y === ctr.y ? new THREE.Vector3(ctr.x, ctr.y, 0) : ctr); return c; }
+const views = [
+  { name: 'TOP · fused homography', cam: ortho(new THREE.Vector3(ctr.x, ctr.y, 3), new THREE.Vector3(-1, 0, 0)), half: 0.26 },
+  { name: 'SIDE · x–z', cam: ortho(new THREE.Vector3(ctr.x, ctr.y - 3, ctr.z), new THREE.Vector3(0, 0, 1)), half: 0.30 },
+  { name: 'ISOMETRIC', cam: ortho(new THREE.Vector3(ctr.x + 1.9, ctr.y - 1.9, ctr.z + 1.6), new THREE.Vector3(0, 0, 1)), half: 0.34 },
+];
+function layout() {
+  const w = main.clientWidth, h = main.clientHeight;
+  if (w >= 700) {
+    const mw = Math.round(w * 0.64), sh = Math.round(h / 3);
+    return { main: { x: 0, y: 0, w: mw, h }, v: [0, 1, 2].map(i => ({ x: mw, y: i * sh, w: w - mw, h: i === 2 ? h - 2 * sh : sh })) };
+  }
+  const mh = Math.round(h * 0.58), vw = Math.round(w / 3);
+  return { main: { x: 0, y: 0, w, h: mh }, v: [0, 1, 2].map(i => ({ x: i * vw, y: mh, w: i === 2 ? w - 2 * vw : vw, h: h - mh })) };
+}
+
+// dynamic layer: objects, planned path, trail, pick/place markers
+const dyn = new THREE.Group(); scene.add(dyn);
+const line = (pts, color, width) => new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts.map(p => new THREE.Vector3().fromArray(p))), new THREE.LineBasicMaterial({ color, linewidth: width }));
+let labelDefs = [];
+
+function applyState(st) {
+  setTop(st.top);
+  // arm
+  (st.poses || []).forEach((p, i) => {
+    const m = armMeshes[i]; if (!m) return;
+    m.matrix.set(p[3], p[4], p[5], p[0], p[6], p[7], p[8], p[1], p[9], p[10], p[11], p[2], 0, 0, 0, 1);
+    m.matrixWorldNeedsUpdate = true;
+  });
+  if (st.tcp) tcpDot.position.fromArray(st.tcp);
+  // objects + paths
+  while (dyn.children.length) { const c = dyn.children.pop(); c.geometry && c.geometry.dispose(); }
+  labelDefs = [];
+  (st.objects || []).forEach(o => {
+    const h = Math.max(o.height, 0.01), isT = o.role === 'target';
+    const m = new THREE.Mesh(new THREE.CylinderGeometry(o.diameter / 2, o.diameter / 2, h, 32),
+      new THREE.MeshStandardMaterial({ color: col(isT ? '--target' : '--obj'), transparent: true, opacity: isT ? 0.85 : 0.6, roughness: 0.7 }));
+    m.rotation.x = Math.PI / 2; m.position.set(o.axis[0], o.axis[1], h / 2); dyn.add(m);
+    labelDefs.push({ pos: new THREE.Vector3(o.axis[0], o.axis[1], h + 0.02), text: `${o.name}${isT ? ' · target' : ''}` });
+  });
+  if ((st.path || []).length > 1) dyn.add(line(st.path, col('--warn'), 2));
+  if ((st.trail || []).length > 1) dyn.add(line(st.trail, col('--good'), 3));
+  [['pick', '--warn'], ['place', '--cam0']].forEach(([k, c]) => {
+    if (!st[k]) return;
+    const r = new THREE.Mesh(new THREE.RingGeometry(0.012, 0.018, 32), new THREE.MeshBasicMaterial({ color: col(c), side: THREE.DoubleSide }));
+    r.position.set(st[k][0], st[k][1], 0.002); dyn.add(r);
+    labelDefs.push({ pos: new THREE.Vector3(st[k][0], st[k][1], 0.005), text: k });
+  });
+  S.cameras.forEach(c => labelDefs.push({ pos: new THREE.Vector3().fromArray(c.center).add(new THREE.Vector3(0, 0, 0.03)), text: c.name }));
+  rebuildLabels();
+  // sidebar
+  const jEl = $('joints'); jEl.innerHTML = '';
+  (st.q || []).forEach((v, i) => { const d = document.createElement('div'); d.innerHTML = i < 6 ? `${(v * 180 / Math.PI).toFixed(0)}<small>j${i + 1}</small>` : `${(v * 100).toFixed(0)}%<small>grip</small>`; jEl.appendChild(d); });
+  $('tcp').innerHTML = st.tcp ? `<dt>fingertips</dt><dd>${f3(st.tcp)} m</dd>` : '';
+  const oEl = $('objects'); oEl.innerHTML = '';
+  if (!(st.objects || []).length) oEl.innerHTML = '<p class="note">Nothing on the table.</p>';
+  (st.objects || []).forEach(o => {
+    const d = document.createElement('div'); d.className = 'card';
+    d.innerHTML = `<div class="name"><i class="sw" style="background:var(${o.role === 'target' ? '--target' : '--obj'})"></i><span></span></div>
+      <dl class="kv"><dt>axis (x, y)</dt><dd>${f3(o.axis)} m</dd><dt>size</dt><dd>${cm(o.diameter)} × ${cm(o.height)}</dd></dl>`;
+    d.querySelector('span').textContent = o.name + (o.role === 'target' ? ' · target' : '');
+    oEl.appendChild(d);
+  });
+  $('phase').textContent = st.phase || (st.status === 'idle' ? 'No run in progress' : st.status);
+  if (st.batch) $('phase').textContent = `Run ${st.batch} · ` + $('phase').textContent;
+  const g = [];
+  if (st.mode) g.push(`<dt>grasp</dt><dd>${st.mode === 'side' ? 'horizontal (side)' : 'vertical (top)'}</dd>`);
+  if (st.z_grasp != null) g.push(`<dt>closes at</dt><dd>${cm(st.z_grasp)} above the table</dd>`);
+  if (st.pick) g.push(`<dt>pick → place</dt><dd>${f3(st.pick)} → ${f3(st.place)}</dd>`);
+  $('grasp').innerHTML = g.join('');
+  const sEl = $('steps'); sEl.innerHTML = '';
+  (st.steps || []).forEach((s, i) => { const li = document.createElement('li'); li.textContent = s; li.className = i < st.step || st.status === 'done' ? 'done' : i === st.step ? 'now' : ''; sEl.appendChild(li); });
+  const now = sEl.querySelector('.now'); if (now) now.scrollIntoView({ block: 'nearest' });
+  lastState = st; updatePill(); render();
+}
+
+let lastState = S.initial, liveOn = false;
+function updatePill() {
+  const st = lastState, age = st.updated ? (Date.now() - st.updated) / 1000 : Infinity;
+  let cls = 'idle', txt = liveOn ? 'idle' : 'snapshot';
+  if (st.status === 'running' || st.status === 'planning') { cls = age < 20 ? 'live' : 'stale'; txt = age < 20 ? 'live' : 'waiting for updates'; }
+  else if (st.status === 'done') { cls = 'done'; txt = 'run finished'; }
+  else if (st.status === 'aborted') { cls = 'aborted'; txt = 'run aborted'; }
+  $('pill').className = 'pill ' + cls; $('pill').textContent = txt;
+  $('updated').textContent = st.updated ? 'updated ' + new Date(st.updated).toLocaleTimeString() : '';
+}
+setInterval(updatePill, 5000);
+
+// labels overlay
+const labelsEl = $('labels'); let labelNodes = [];
+function rebuildLabels() {
+  labelsEl.innerHTML = '';
+  labelNodes = labelDefs.map(d => { const n = document.createElement('div'); n.className = 'lbl'; n.textContent = d.text; labelsEl.appendChild(n); return n; });
+}
+function updateLabels() {
+  const r = layout().main;
+  labelDefs.forEach((d, i) => {
+    const p = d.pos.clone().project(camera), n = labelNodes[i]; if (!n) return;
+    n.hidden = !(p.z < 1 && Math.abs(p.x) < 1.0 && Math.abs(p.y) < 1.0);
+    n.style.left = (r.x + (p.x + 1) / 2 * r.w) + 'px'; n.style.top = (r.y + (1 - p.y) / 2 * r.h) + 'px';
+  });
+}
+
+// controls
+let drag = null;
+canvas.addEventListener('pointerdown', e => { drag = { x: e.clientX, y: e.clientY, b: e.button }; canvas.setPointerCapture(e.pointerId); });
+canvas.addEventListener('pointerup', () => drag = null);
+canvas.addEventListener('contextmenu', e => e.preventDefault());
+canvas.addEventListener('pointermove', e => {
+  if (!drag) return;
+  const dx = e.clientX - drag.x, dy = e.clientY - drag.y; drag.x = e.clientX; drag.y = e.clientY;
+  if (drag.b === 2 || e.shiftKey) {
+    const right = new THREE.Vector3().crossVectors(camera.getWorldDirection(new THREE.Vector3()), camera.up).normalize();
+    target.addScaledVector(right, -dx * 0.0015 * sph.r).addScaledVector(camera.up, dy * 0.0015 * sph.r);
+  } else { sph.theta -= dx * 0.006; sph.phi = Math.min(Math.PI - 0.05, Math.max(0.05, sph.phi - dy * 0.006)); }
+  placeCam(); render();
+});
+canvas.addEventListener('wheel', e => { e.preventDefault(); sph.r = Math.min(5, Math.max(0.2, sph.r * Math.exp(e.deltaY * 0.001))); placeCam(); render(); }, { passive: false });
+let pinch = null;
+canvas.addEventListener('touchmove', e => { if (e.touches.length === 2) { const d = Math.hypot(e.touches[0].clientX - e.touches[1].clientX, e.touches[0].clientY - e.touches[1].clientY); if (pinch) { sph.r = Math.min(5, Math.max(0.2, sph.r * pinch / d)); placeCam(); render(); } pinch = d; e.preventDefault(); } }, { passive: false });
+canvas.addEventListener('touchend', () => pinch = null);
+
+function resize() {
+  const w = main.clientWidth, h = main.clientHeight;
+  renderer.setSize(w, h, false);
+  const L = layout();
+  $('vtitles').innerHTML = L.v.map((r, i) => `<div class="vframe" style="left:${r.x}px;top:${r.y}px;width:${r.w}px;height:${r.h}px"></div><div class="vtitle" style="left:${r.x}px;top:${r.y}px">${views[i].name}</div>`).join('');
+  render();
+}
+function render() {
+  const h = main.clientHeight, L = layout();
+  renderer.setScissorTest(true);
+  renderer.setClearColor(col('--sky'));
+  const vp = r => { renderer.setViewport(r.x, h - r.y - r.h, r.w, r.h); renderer.setScissor(r.x, h - r.y - r.h, r.w, r.h); };
+  vp(L.main); camera.aspect = L.main.w / L.main.h; camera.updateProjectionMatrix(); renderer.render(scene, camera);
+  L.v.forEach((r, i) => {
+    const c = views[i].cam, a = r.w / r.h, s = views[i].half;
+    c.left = -s * a; c.right = s * a; c.top = s; c.bottom = -s; c.updateProjectionMatrix();
+    vp(r); renderer.render(scene, c);
+  });
+  renderer.setScissorTest(false);
+  updateLabels();
+}
+new ResizeObserver(resize).observe(main);
+matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => { tableMat.color = col('--table'); render(); });
+placeCam(); applyState(S.initial); resize();
+
+// live: one shared doc, written while pick_place.py --run is going
+(async () => {
+  const db = window.claude && window.claude.use ? await window.claude.use('db') : null;
+  if (!db) { $('livenote').textContent = 'Live updates are not available in this view; showing the last saved pose.'; return; }
+  liveOn = true; updatePill();
+  db.doc('live/state').onSnapshot(snap => {
+    if (!snap.exists) { $('livenote').textContent = 'Waiting for a run to start.'; return; }
+    $('livenote').textContent = '';
+    applyState(snap.data());
+  }, () => { $('livenote').textContent = 'Live updates stopped; reload to reconnect.'; });
+})();
+</script>
