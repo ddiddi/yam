@@ -893,6 +893,7 @@ def grasp_ahead(planner: "AzPlanner", plan: "Plan") -> np.ndarray:
     return (SLIDE_SHORT - side_deep(plan.obj, zg)) * u
 
 
+TIP_PROBE = 0.015  # --tip-probe: extra room assumed beyond each open fingertip when screening grasp poses
 TABLE_SLACK = 0.004  # --table-slack: how far below the commanded fingertip height any part may go on a low leg
 
 
@@ -1271,7 +1272,7 @@ def grasp_candidates(planner: AzPlanner, ws: Workspace, obj: Obj, mode: str, pic
         if across is not None and abs(float(jd @ across)) > np.sin(np.radians(JAW_ALIGN_DEG)):
             continue  # the jaw would close along the long side: too wide, or fingertips landing on a handle
         half = obj.grip_width / 2 if across is not None else obj.radius
-        probes = [np.array(pick) + s * (half + JAW_GAP + 0.015) * jd for s in (1, -1)]  # the two tips
+        probes = [np.array(pick) + s * (half + JAW_GAP + TIP_PROBE) * jd for s in (1, -1)]  # the two tips
         if mode == "side":  # ... and the lane the fingers travel down
             ad = planner.approach_dir(pick, yaw, tilt, az)[:2]
             ad = ad / (np.linalg.norm(ad) + 1e-9)
@@ -2744,6 +2745,9 @@ class Args:
     spline instead of stopping at each waypoint; the blended path is collision-checked as travelled."""
     cam_moved_px: float = 3.0
     """How far (px) a camera's fixed background may shift before it counts as moved (~0.7 mm/px at the table)."""
+    tip_probe: float = 0.015
+    """Extra room (m) assumed beyond each open fingertip when screening grasp poses; the full arm-vs-object
+    check at --margin still runs on the whole plan afterwards."""
     table_slack: float = 0.004
     """How far (m) below the commanded fingertip height any part of the arm may reach on a low leg. A slightly
     tilted wrist hangs the finger edges ~6 mm below the fingertip point: 0.007 lets a 1.6 cm tube be taken at
@@ -3193,7 +3197,8 @@ def stage_run(args: Args) -> None:
 
 
 def main(args: Args) -> None:
-    global JAW_ACROSS, MAX_OBJ_WIDTH, SIDE_TILTS, TABLE_SLACK, CAM_MOVED_PX
+    global JAW_ACROSS, MAX_OBJ_WIDTH, SIDE_TILTS, TABLE_SLACK, CAM_MOVED_PX, TIP_PROBE
+    TIP_PROBE = float(args.tip_probe)
     CAM_MOVED_PX = float(args.cam_moved_px)
     TABLE_SLACK = float(args.table_slack)
     SIDE_TILTS = tuple(float(np.radians(t)) for t in args.side_tilt)
