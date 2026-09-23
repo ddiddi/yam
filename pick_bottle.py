@@ -317,6 +317,7 @@ class Arm:
         cubic spline over joint-space arc length, and travelled with the minimum-jerk time law
         s = 10t^3 - 15t^4 + 6t^5: velocity and acceleration are zero at both ends and continuous in between.
         Commands go out on an absolute clock, so the timing does not drift."""
+        seconds = seconds / getattr(self, "speed", 1.0)  # --speed: every arm motion scaled at once
         Q = np.vstack([self.q()] + [np.asarray(q, dtype=float)[:6] for q in qs])
         d = np.r_[0.0, np.cumsum(np.linalg.norm(np.diff(Q, axis=0), axis=1))]
         keep = np.r_[True, np.diff(d) > 1e-6]  # repeated waypoints would break the spline
@@ -342,6 +343,7 @@ class Arm:
 
     def set_grip(self, g: float, seconds: float = 1.5) -> None:
         q6 = np.array(self.last_cmd[:6], dtype=float)  # hold the commanded pose, not the sagging measured one
+        seconds = seconds / getattr(self, "speed", 1.0)
         g0 = self.grip
         steps = max(1, int(seconds * self.hz))
         for i in range(steps + 1):

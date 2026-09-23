@@ -907,6 +907,36 @@ def follow(arm: Arm, planner: AzPlanner, ws: "Workspace", qs: list, seconds: flo
     arm.glide_path([np.asarray(v, dtype=float) for v in qs], seconds)
 
 
+def spline_samples(q0: np.ndarray, qs: list, n: int = 80) -> list[np.ndarray]:
+    """The joint path Arm.glide_path will really travel through q0 -> qs (C2 spline over arc length), sampled."""
+    Q = np.vstack([np.asarray(q0, dtype=float)[:6]] + [np.asarray(q, dtype=float)[:6] for q in qs])
+    d = np.r_[0.0, np.cumsum(np.linalg.norm(np.diff(Q, axis=0), axis=1))]
+    keep = np.r_[True, np.diff(d) > 1e-6]
+    Q, d = Q[keep], d[keep]
+    if len(Q) < 3:
+        return [Q[0] + (Q[-1] - Q[0]) * t for t in np.linspace(0, 1, n)]
+    from scipy.interpolate import CubicSpline
+    spl = CubicSpline(d / d[-1], Q, axis=0, bc_type="natural")
+    return [spl(t) for t in np.linspace(0, 1, n)]
+
+
+def smooth_follow(arm: Arm, planner: AzPlanner, ws: "Workspace", qs: list, seconds: float, carry, floor_z: float) -> None:
+    """Several validated legs as ONE continuous motion (no stop at the via points). The spline through them
+    rounds the corners, so the path it really takes is swept against the objects and the table first."""
+    ws.jaw_half = float(np.clip(arm.grip, 0.0, 1.0)) * JAW_STROKE / 2
+    pts = spline_samples(arm.q(), qs)
+    for a, b in zip(pts[:-1], pts[1:]):
+        gap, who, zmin = ws.scan(a, b, carry, n=3)
+        if zmin < floor_z:
+            raise RuntimeError(f"the blended path would reach {zmin * 100:.1f} cm: too low")
+        if gap < 0:
+            raise RuntimeError(f"the blended path would enter {who}")
+    arm.glide_path([np.asarray(q, dtype=float) for q in qs], seconds)
+
+
+BLEND_KINDS = ("line", "joint", "pose")
+
+
 def move_line(arm: Arm, planner: AzPlanner, ws: "Workspace", xyz, yaw: float, tilt: float, seconds: float,
               carry=None, step: float = 0.02, qs: list | None = None) -> None:
     """`pick_bottle.move_cartesian` with the swept-mesh table check instead of the fixed 2 cm floor.
@@ -1859,7 +1889,12 @@ def view_gate(plan: Plan, planner: AzPlanner, ws: Workspace, q_start: np.ndarray
         hm = (lo, _d.CELL, cv2.dilate(Hn.astype(np.float32), np.ones((2 * r + 1, 2 * r + 1), np.uint8)))
     th = safe_height(plan.obj)
     tol = TALL_TOL if th > TALL_H else TARGET_TOL
+    full_open = False  # the jaw is swept at the opening each leg really has (as in validate)
+    keep_jaw = ws.jaw_half
     for wp in walk:
+        ws.jaw_half = 0.0475 if (full_open or wp.kind in ("rest", "pose")) else plan.open_grip * JAW_STROKE / 2
+        if wp.grip is not None and wp.grip >= GRIP_OPEN - 1e-6:
+            full_open = True  # opens fully once this leg arrives: the legs after it sweep it open
         if wp.kind == "close":
             holding = True
             continue
@@ -1917,6 +1952,7 @@ def view_gate(plan: Plan, planner: AzPlanner, ws: Workspace, q_start: np.ndarray
     src = ", ".join(f"{k} {v}" for k, v in why.items() if v)
     print(f"   fused-view check ({label}): " + ("clear" if ok else f"{int(bad.sum())} points inside a clearance ({src})") +
           " -> captures/fused_views.jpg")
+    ws.jaw_half = keep_jaw
     return ok
 
 
@@ -2492,11 +2528,17 @@ def execute(plan: Plan, planner: AzPlanner, arm: Arm, cam: LiveCamera | None, cm
     unfold, above = plan.waypoints[0], plan.waypoints[1]
     step(0, unfold.label)
     arm.set_grip(unfold.grip if unfold.grip is not None else GRIP_OPEN, 1.0)
-    goto_joint(arm, planner, np.array(unfold.q), unfold.seconds)
-    step(1, above.label)
-    q = above.qs[-1] if above.qs else planner.ik(above.xyz[0], above.xyz[1], above.xyz[2], arm.q(), plan.yaw,
+    q = above.qs[-1] if above.qs else planner.ik(above.xyz[0], above.xyz[1], above.xyz[2], unfold.q, plan.yaw,
                                                   plan.tilt)[0]
-    goto_joint(arm, planner, np.asarray(q, dtype=float), above.seconds)
+    if args.blend and not (args.servo and plan.servo_ok and cam is not None):
+        step(1, above.label)
+        print(f"   (blended: {unfold.label} -> {above.label})")
+        smooth_follow(arm, planner, ws, [np.array(unfold.q), np.asarray(q, dtype=float)],
+                      unfold.seconds + above.seconds, None, 0.01)
+    else:
+        goto_joint(arm, planner, np.array(unfold.q), unfold.seconds)
+        step(1, above.label)
+        goto_joint(arm, planner, np.asarray(q, dtype=float), above.seconds)
     if args.servo and plan.servo_ok and cam is not None:
         step(1, "visual check next to the object")
         # get there over the top and then straight down: the check's own straight line from above the object
@@ -2601,7 +2643,7 @@ def _run_legs(plan: Plan, planner: AzPlanner, arm: Arm, cam: LiveCamera | None, 
             if args.pour_over and holding:
                 do_pour(arm, planner, ws, plan, args)
             time.sleep(wp.seconds)
-        elif wp.kind in ("rest", "pose"):
+        elif wp.kind == "rest" or (wp.kind == "pose" and not args.blend):
             goto_joint(arm, planner, np.array(REST if wp.kind == "rest" else wp.q), wp.seconds)
         elif args.brute and wp.label == "descend onto the object":
             if not brute_grasp(plan, planner, arm, args, live):
@@ -2613,7 +2655,36 @@ def _run_legs(plan: Plan, planner: AzPlanner, arm: Arm, cam: LiveCamera | None, 
                 bail(arm, planner, ws, plan, False, "the touch search found no spot where the fingers come down beside it")
                 return False
         else:
-            move_line(arm, planner, ws, wp.xyz, plan.yaw, plan.tilt, wp.seconds, carry, qs=wp.qs)
+            j = i
+            if args.blend and wp.qs and not wp.settle and wp.grip is None:
+                # chain the following plain legs into one motion: stop only where something happens
+                while j + 1 < len(plan.waypoints):
+                    nx = plan.waypoints[j + 1]
+                    if nx.kind == "hold" and nx.seconds <= 0 and not (args.pour_over and holding):
+                        j += 1
+                        continue
+                    if nx.kind not in BLEND_KINDS or not nx.qs or nx.label == "descend onto the object":
+                        break
+                    j += 1
+                    if nx.settle or nx.grip is not None:
+                        break
+                    if nx.kind == "pose" and nx.q is not None and np.allclose(nx.q, REST):
+                        break
+            if j > i:
+                legs = [w for w in plan.waypoints[i:j + 1] if w.kind in BLEND_KINDS]
+                qs_all = [q for w in legs for q in w.qs]
+                zs = [planner.fk_pos(np.asarray(q, dtype=float))[2] for q in qs_all]
+                print(f"   (blended: {' -> '.join(w.label for w in legs)})")
+                for k in range(i + 1, j + 1):
+                    step(k, plan.waypoints[k].label)
+                smooth_follow(arm, planner, ws, qs_all, sum(w.seconds for w in legs), carry,
+                              table_floor(min(zs), min(zs)) - 0.004)
+                wp = plan.waypoints[j]
+                i = j
+            elif wp.kind == "pose":
+                goto_joint(arm, planner, np.array(wp.q), wp.seconds)
+            else:
+                move_line(arm, planner, ws, wp.xyz, plan.yaw, plan.tilt, wp.seconds, carry, qs=wp.qs)
             if wp.settle:  # a refinement on top of a leg that already arrived: skip it if IK has no answer
                 try:
                     pos = settle(arm, planner, wp.xyz[0], wp.xyz[1], wp.xyz[2], plan.yaw, plan.tilt)
@@ -2652,6 +2723,11 @@ class Args:
     side_tilt: tuple[float, ...] = ()
     """Side-grasp wrist tilts to try, in degrees from vertical, in order (e.g. 85 80 75 70 60 for a near-
     horizontal pick of a flat object: the flatter the fingers, the lower they cross it). Default: 60."""
+    speed: float = 1.0
+    """Scale every arm and jaw motion (2 = twice as fast). The contact-sensing close keeps its own pace."""
+    blend: bool = False
+    """Travel consecutive plain legs (unfold -> above, lift -> carry -> lower, clear -> fold) as one smooth
+    spline instead of stopping at each waypoint; the blended path is collision-checked as travelled."""
     cam_moved_px: float = 3.0
     """How far (px) a camera's fixed background may shift before it counts as moved (~0.7 mm/px at the table)."""
     table_slack: float = 0.004
@@ -2985,6 +3061,7 @@ def stage_run(args: Args) -> None:
         # and inflated the bottle's measured height from 12.5 to 17.0 cm, flipping the grasp decision from
         # vertical to horizontal. Its joint angles are known, so project it out of the frame instead.
         arm = Arm(args.sim, args.channel, args.hz)
+        arm.speed = float(args.speed)
     except Exception:
         for lc in cams.values():
             lc.close()
