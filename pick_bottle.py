@@ -638,7 +638,7 @@ def soft_close(arm: "Arm", start: float | None = None, preload: float = 0.005, s
         arm.grip = g = max(0.0, meas - preload)
         arm._cmd(np.array(arm.last_cmd[:6], dtype=float))
         time.sleep(0.35)
-        if blocked(arm):
+        if blocked(arm) and meas > 0.03:  # stalled on the object, not the fingers meeting each other (~2-3 mm)
             m = float(arm.state7()[6])
             print(f"   soft contact at {m * 95:.1f} mm ({why}); holding {(m - g) * 95:.1f} mm past the touch")
             return m

@@ -2141,7 +2141,7 @@ def brute_candidates(plan: Plan, planner: AzPlanner, centre) -> list[np.ndarray]
 DISC_FULL = 0.008  # m: a round object is held across its diameter once the jaw is within this of it
 
 
-def centre_on_disc(plan: Plan, planner: AzPlanner, arm: Arm, args: "Args", xy: np.ndarray, z_h: float) -> None:
+def centre_on_disc(plan: Plan, planner: AzPlanner, arm: Arm, args: "Args", xy: np.ndarray, z_h: float) -> bool:
     """A round object held across a chord - the jaw closed at w < its diameter - sits sqrt(r^2 - (w/2)^2)
     off-centre, perpendicular to the jaw, and tips as it is lifted. Re-grasp shifted by that much: one side
     first (then once more that way if the chord grew but is not full yet), else the other side. Ends on the
@@ -2155,31 +2155,32 @@ def centre_on_disc(plan: Plan, planner: AzPlanner, arm: Arm, args: "Args", xy: n
 
     def regrasp(to: np.ndarray) -> float | None:
         nonlocal at
-        try:
-            arm.set_grip(plan.open_grip, 0.8)
+        try:  # open wide (a dish can be 5 mm narrower than the stroke), rise straight up, then shift
+            arm.set_grip(1.0, 0.8)
+            time.sleep(0.3)
             q, _, _ = planner.ik(at[0], at[1], z_h, np.array(arm.last_cmd[:6], dtype=float), plan.yaw, plan.tilt)
-            arm.glide(q, 0.6)
+            arm.glide(q, 1.0)
             q, _, _ = planner.ik(to[0], to[1], z_h, q, plan.yaw, plan.tilt)
-            arm.glide(q, 0.7)
+            arm.glide(q, 0.8)
             path, qq = [], q
             for z in np.linspace(z_h, plan.z_grasp, 4)[1:]:
                 qq, _, _ = planner.ik(to[0], to[1], z, qq, plan.yaw, plan.tilt)
                 path.append(qq)
-            arm.glide_path(path, 1.0)
+            arm.glide_path(path, 1.6)  # slower: a finger landing on the rim should not push it
             time.sleep(0.3)
         except RuntimeError as e:
             print(f"   (re-grasp at ({to[0]:+.3f}, {to[1]:+.3f}) unreachable: {e})")
             return None
         at = np.array(to, dtype=float)
-        grip_on_object(arm, args, plan.obj.grip_width)
-        w = float(arm.state7()[6]) * JAW_STROKE
+        held = grip_on_object(arm, args, plan.obj.grip_width)
+        w = float(arm.state7()[6]) * JAW_STROKE if held else 0.0
         print(f"   re-grasp at ({to[0]:+.3f}, {to[1]:+.3f}): across {w * 100:.1f} cm")
         return w
 
     w0 = float(arm.state7()[6]) * JAW_STROKE
     if full(w0):
         print(f"   held across {w0 * 100:.1f} cm of its {2 * r * 100:.1f} cm diameter: centred")
-        return
+        return True
     print(f"   held across a {w0 * 100:.1f} cm chord of a {2 * r * 100:.1f} cm disc: "
           f"{offc(w0) * 100:.1f} cm off-centre - re-grasping centred")
     tried = [(w0, np.array(xy, dtype=float))]
@@ -2187,23 +2188,28 @@ def centre_on_disc(plan: Plan, planner: AzPlanner, arm: Arm, args: "Args", xy: n
     if wa is not None:
         tried.append((wa, at.copy()))
         if full(wa):
-            return
+            return True
         if wa > w0 + 0.004:  # the right way, not far enough yet
             wb = regrasp(at + offc(wa) * u)
             if wb is not None:
                 tried.append((wb, at.copy()))
                 if full(wb):
-                    return
+                    return True
     if max(t[0] for t in tried) <= w0 + 0.004:  # the other way
         wc = regrasp(xy - offc(w0) * u)
         if wc is not None:
             tried.append((wc, at.copy()))
             if full(wc):
-                return
+                return True
     w_best, xy_best = max(tried, key=lambda t: t[0])
+    w = float(arm.state7()[6]) * JAW_STROKE
     if not np.allclose(xy_best, at):
-        w = regrasp(xy_best)
-        print(f"   back to the widest grasp ({w_best * 100:.1f} cm)")
+        w = regrasp(xy_best) or 0.0
+        print(f"   back to the widest grasp ({w_best * 100:.1f} cm): now across {w * 100:.1f} cm")
+    if w < 0.5 * w_best:  # it is not where it was held: it was nudged - the caller searches again
+        print("   !! the object is no longer where it was held (nudged while re-grasping)")
+        return False
+    return True
 
 
 def brute_grasp(plan: Plan, planner: AzPlanner, arm: Arm, args: "Args", live=None) -> bool:
@@ -2236,7 +2242,11 @@ def brute_grasp(plan: Plan, planner: AzPlanner, arm: Arm, args: "Args", live=Non
                 print(f"   try {n} at ({xy[0]:+.3f}, {xy[1]:+.3f}): HOLDING - "
                       f"{np.linalg.norm(xy - np.array(plan.pick)) * 100:.1f} cm from the camera estimate")
                 if plan.obj.long_axis is None and plan.obj.measured:
-                    centre_on_disc(plan, planner, arm, args, np.array(xy, dtype=float), z_h)
+                    if not centre_on_disc(plan, planner, arm, args, np.array(xy, dtype=float), z_h):
+                        arm.set_grip(1.0, 0.8)
+                        q, _, _ = planner.ik(xy[0], xy[1], z_h, np.array(arm.last_cmd[:6], dtype=float), plan.yaw, plan.tilt)
+                        arm.glide(q, 0.8)
+                        continue  # keep searching (nearest first from the last hold)
                 return True
             print(f"   try {n} at ({xy[0]:+.3f}, {xy[1]:+.3f}): nothing - next")
             arm.set_grip(plan.open_grip, 0.8)
