@@ -189,6 +189,17 @@ class Obj:
     def radius(self) -> float:
         return self.diameter / 2
 
+    def footprint(self, xy=None) -> tuple[np.ndarray, float]:
+        """(centres, r): the footprint as circles - one for a round object; for an elongated one, circles of
+        half its width strung along its axis (a 13.7 x 1.4 cm tube is not a 6.9 cm-radius disc)."""
+        c = np.asarray(self.xy if xy is None else xy, dtype=float)
+        ax = self.long_axis
+        if ax is None:
+            return c[None], self.radius
+        half = max(self.length / 2 - self.width / 2, 0.0)
+        n = max(2, int(np.ceil(2 * half / max(self.width, 0.01))) + 1)
+        return np.array([c + t * ax for t in np.linspace(-half, half, n)]), self.width / 2
+
     @property
     def reach(self) -> float:
         return float(np.hypot(*self.xy))
@@ -849,7 +860,9 @@ def carried_points(obj: Obj, z_grasp: float, ahead=(0.0, 0.0)):
     It was grasped `z_grasp` above its base, so it sticks out that far below the fingertips, and its axis
     is `ahead` (xy) beyond the fingertips (a side grasp stops SLIDE_SHORT before the centre)."""
     th = np.linspace(0, 2 * np.pi, 12, endpoint=False)
-    ring = np.stack([np.cos(th), np.sin(th)], axis=1) * (obj.radius + 0.005) + np.asarray(ahead, dtype=float)
+    cs, fr = obj.footprint((0.0, 0.0))  # the orientation does not change while it is carried (same wrist yaw)
+    ring = np.concatenate([np.stack([np.cos(th), np.sin(th)], axis=1) * (fr + 0.005) + c for c in cs])
+    ring = ring + np.asarray(ahead, dtype=float)
 
     def f(tip: np.ndarray) -> np.ndarray:
         lo = max(tip[2] - z_grasp, 0.0)
@@ -1305,9 +1318,10 @@ def choose_place(planner: AzPlanner, ws: Workspace, obj: Obj, pick: tuple[float,
         if not (REACH[0] <= r <= REACH[1]):
             continue
         zone = load_zone()
-        if zone is not None and zone_margin(p, zone) < obj.radius + 0.005:
+        cs, fr = obj.footprint(p)
+        if zone is not None and min(zone_margin(c, zone) for c in cs) < fr + 0.005:
             continue  # the whole footprint must land inside the zone
-        gap, _ = free_gap(p, ws.obstacles, obj.radius)
+        gap = min(free_gap(c, ws.obstacles, fr)[0] for c in cs)
         if gap < 0 and forced_deg is None:
             continue
         try:
