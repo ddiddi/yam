@@ -2458,6 +2458,7 @@ def do_pour(arm: Arm, planner: AzPlanner, ws: "Workspace", plan: Plan, args: "Ar
     arm.glide_path([q_lift], 3.0)  # back to the lift pose
 
 
+HOLD_TEST_LIFT = 0.02  # m: the hold test lift (5 mm passed a dish that slid out 2 s into the carry)
 HOLD_SPEED = 1.0  # --soft: the arm never moves faster than this while it holds the object (a 2x lift dropped the dish)
 
 
@@ -2478,11 +2479,11 @@ def _secure_hold(arm: Arm, planner: AzPlanner, plan: Plan, args: "Args") -> None
     try:
         cmd = np.array(arm.last_cmd[:6], dtype=float)
         here = planner.fk_pos(cmd)
-        q_up, _, _ = planner.ik(here[0], here[1], here[2] + 0.005, cmd, plan.yaw, plan.tilt)
+        q_up, _, _ = planner.ik(here[0], here[1], here[2] + HOLD_TEST_LIFT, cmd, plan.yaw, plan.tilt)
         for k in range(5):
             s_held = SKIN.magnitude() if SKIN is not None else None
-            arm.glide(q_up, 0.7)
-            time.sleep(0.4)
+            arm.glide(q_up, 1.0)
+            time.sleep(0.8)  # a slow slip shows within a second
             e = load(arm, 8)
             s_up = SKIN.magnitude() if SKIN is not None else None
             slip = e < free + 0.5 * (target - free) or (s_held is not None and s_held > 100 and s_up < 0.5 * s_held)
@@ -2491,8 +2492,12 @@ def _secure_hold(arm: Arm, planner: AzPlanner, plan: Plan, args: "Args") -> None
                   + ("slipping - back down, firmer" if slip else "held"))
             if not slip:
                 return
+            if e < free + 0.03 and (s_up is None or s_up < 0.8 * (s_held or 1e9) or k > 0):
+                print("   !! the jaw is empty (load at its free level): the grasp was lost - not squeezing harder")
+                arm.glide(cmd, 0.7)
+                return
             arm.glide(cmd, 0.7)
-            target = min(target + 0.05, free + 3 * args.grip_load)
+            target = min(target + 0.05, free + args.grip_load + 0.10)  # never near the load that flexed the dish
             for _ in range(30):  # close in small steps until the load reaches the new target
                 if load(arm, 6) >= target:
                     break
@@ -2718,7 +2723,8 @@ def _run_legs(plan: Plan, planner: AzPlanner, arm: Arm, cam: LiveCamera | None, 
             if wp.grip is not None and (wp.release or wp.grip >= GRIP_OPEN - 1e-6) and holding and args.soft:
                 from pick_bottle import load
                 e, free = load(arm, 10), getattr(arm, "free_load", 0.0)
-                if e < free + 0.03:
+                tgt = getattr(arm, "hold_load", free + args.grip_load)
+                if e < free + 0.5 * (tgt - free):  # half-way to the hold load: an empty jaw reads ~free
                     print(f"!! at the place point the gripper load is {e:.2f} (free {free:.2f}): the object is not in "
                           "the jaw - it was dropped on the way")
                     arm.speed = getattr(arm, "speed_free", arm.speed)

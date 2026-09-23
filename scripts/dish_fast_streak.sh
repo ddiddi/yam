@@ -8,8 +8,8 @@ for n in 1 2 3 4 5; do
   echo "=== run $n/5: dish at ($xy)"
   [ -z "$xy" ] && { echo "dish not found - stopping"; exit 1; }
   L=captures/live/run_dish_fast_$n.log
-  YAM_BATCH="dish fast $n/5" .venv/bin/python -u pick_place.py --run --speed 2 --blend --hold 0 --no-rescan --cam-moved-px 8 \
-    --object 0 --grasp side --side-only --side-cross-max 1.0 --side-tilt 42 40 --z-grasp 0.013 --max-width 0.092 --soft \
+  YAM_BATCH="dish fast $n/5" .venv/bin/python -u pick_place.py --run --speed 2 --blend --hold 0 --no-rescan --cam-moved-px 4 \
+    --object 0 --grasp side --side-only --side-cross-max 1.0 --side-tilt 42 40 --z-grasp 0.013 --max-width 0.092 --soft --grip-load 0.18 \
     --no-servo --given-only --given "$xy,0.09,0.015" --record datasets/yam_zone_swap --tactile > $L 2>&1
   st=$(python3 -c "import json;print(json.load(open('captures/live/state.json'))['status'])")
   grep -E "soft contact|grip check|hold test|fingertips at|saved LeRobot" $L | tail -5
