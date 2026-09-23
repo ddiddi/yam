@@ -2302,10 +2302,12 @@ SKIN = None  # the tactile skin while a --tactile run is going (soft grasps use 
 
 
 def secure_hold(arm: Arm, planner: AzPlanner, plan: Plan, args: "Args") -> None:
-    """After a soft close: lift 5 mm and check the fingers are still stalled on the object (if it slid out they
-    close onto their command). If it slipped - or the skin lost most of its pressure - set back down, tighten
-    0.5 mm and try again, so the grip only gets as firm as the object needs (at most 5 steps, 2.5 mm)."""
-    from pick_bottle import blocked
+    """After a soft close: lift 5 mm and read the gripper motor load. Still loaded (the object's weight and the
+    hold are on the fingers) -> carry on. Load gone, or the skin lost most of its pressure -> it is slipping:
+    set it back down and raise the held load by 0.05 (never past 3x the first target)."""
+    from pick_bottle import load
+    free = getattr(arm, "free_load", 0.0)
+    target = getattr(arm, "hold_load", free + args.grip_load)
     keep, planner.az = planner.az, plan.az
     try:
         cmd = np.array(arm.last_cmd[:6], dtype=float)
@@ -2315,17 +2317,22 @@ def secure_hold(arm: Arm, planner: AzPlanner, plan: Plan, args: "Args") -> None:
             s_held = SKIN.magnitude() if SKIN is not None else None
             arm.glide(q_up, 0.7)
             time.sleep(0.4)
+            e = load(arm, 8)
             s_up = SKIN.magnitude() if SKIN is not None else None
-            slip = not blocked(arm) or (s_held is not None and s_held > 100 and s_up < 0.5 * s_held)
+            slip = e < free + 0.5 * (target - free) or (s_held is not None and s_held > 100 and s_up < 0.5 * s_held)
             sk = "" if s_held is None else f", skin {s_held:.0f} -> {s_up:.0f}"
-            print(f"   hold test {k + 1}: fingers {'stalled' if blocked(arm) else 'NOT stalled'}{sk}: "
-                  + ("slipping - back down, tighten 0.5 mm" if slip else "held"))
+            print(f"   hold test {k + 1}: load {e:.2f} (free {free:.2f}, target {target:.2f}){sk}: "
+                  + ("slipping - back down, firmer" if slip else "held"))
             if not slip:
                 return
             arm.glide(cmd, 0.7)
-            arm.grip = max(0.0, arm.grip - args.soft_preload)
-            arm._cmd(cmd)
-            time.sleep(0.4)
+            target = min(target + 0.05, free + 3 * args.grip_load)
+            for _ in range(30):  # close in small steps until the load reaches the new target
+                if load(arm, 6) >= target:
+                    break
+                arm.grip = max(0.0, arm.grip - 0.001)
+                arm._cmd(cmd)
+                time.sleep(0.05)
         arm.glide(q_up, 0.7)
     finally:
         planner.az = keep
@@ -2337,7 +2344,7 @@ def grip_on_object(arm: Arm, args: "Args", width: float | None = None) -> bool:
     if args.soft:
         from pick_bottle import soft_close
         start = None if width is None else min(arm.grip, (width + 0.01) / JAW_STROKE)
-        g = soft_close(arm, start=start, preload=args.soft_preload, skin=SKIN)
+        g = soft_close(arm, start=start, hold_load=args.grip_load, skin=SKIN)
     else:
         g = close_until_contact(arm, squeeze=args.squeeze)
     holding = g > 0.06
@@ -2542,6 +2549,9 @@ class Args:
     hold with only --soft-preload past it, cap the gripper force at --grip-force, and test the hold by a 5 mm
     lift, tightening 0.5 mm at a time only if it slips."""
     soft_preload: float = 0.005
+    grip_load: float = 0.10
+    """--soft: gripper motor load (above its free-closing load) to hold the object at. The 9 cm dish flexed out of
+    the jaw at ~0.45; 0.10 holds it without bending it."""
     """Gripper units (x 9.5 cm) closed past the first touch in a soft grasp: 0.005 = ~0.5 mm."""
     grip_force: float | None = None
     """Cap the gripper's blocked force (N; the driver default is 50). --soft sets 10 unless given."""

@@ -608,42 +608,85 @@ def blocked(arm: "Arm", margin: float = 0.002) -> bool:
     return float(arm.state7()[6]) - arm.grip > margin
 
 
-def soft_close(arm: "Arm", start: float | None = None, preload: float = 0.005, step: float = 0.004,
-               lag: float = 0.012, eff_rise: float = 0.25, skin=None, skin_rise: float = 60.0) -> float:
-    """Close gently on a fragile object: fast to `start` (a little wider than the object), then 0.4 mm steps,
-    pausing at the first hint of contact - the opening lagging the command by ~1 mm, the motor effort rising,
-    or the tactile skin rising above its resting level - and commanding only `preload` (~0.5 mm) past the
-    touch. A hint only counts if the fingers then stay stalled short of that command (effort and skin drift
-    on their own; free-motion effort reaches 0.3-0.6 in the logs); otherwise the slow close carries on.
-    close_until_contact waits for a 4.8 mm lag and squeezes ~4.8 mm more: it held a 9.0 cm dish at 7.8 cm."""
+def load(arm: "Arm", n: int = 4, dt: float = 0.012) -> float:
+    """Gripper motor load: |effort| averaged over n reads (single reads jitter by +-0.1 while moving)."""
+    v = []
+    for _ in range(n):
+        v.append(gripper_effort(arm))
+        time.sleep(dt)
+    return float(np.mean(v))
+
+
+def soft_close(arm: "Arm", start: float | None = None, preload: float = 0.005, step: float = 0.002,
+               lag: float = 0.012, hold_load: float = 0.10, band: float = 0.03, skin=None, skin_rise: float = 60.0) -> float:
+    """Close gently on a fragile object and hold it at a set motor LOAD, not a set squeeze.
+
+    1. Fast to `start` (a little wider than the object), then 0.2 mm steps, reading the gripper motor's load
+       (averaged) at each. The first steps measure the free-closing load and its noise.
+    2. Contact: the load clearly above that (2 steps running), the opening lagging the command, or the skin.
+    3. Hold: move the command until the load sits at free + `hold_load` (+-band): open it if the object is
+       being squeezed harder (a thin plastic dish flexed ~7 mm at a 0.45 load), close it if the load fell off.
+    4. Confirm before the lift: fingers stalled on the object AND the load inside the band.
+    The logs of the 9 cm dish: free load 0.0-0.1 noise +-0.1; load ~0.2 at first touch, 0.45 once flexed."""
     if start is not None and start < arm.grip:
         arm.set_grip(max(0.0, start), 0.8)
     time.sleep(0.3)
-    e0 = float(np.median([gripper_effort(arm) for _ in range(7)]))
-    s0 = float(np.median([skin.magnitude() for _ in range(7)])) if skin is not None else None
     g = arm.grip
+    free: list[float] = []
+    for _ in range(6):  # free closing load (the motor works a little just moving the fingers)
+        g = max(0.0, g - step)
+        arm.grip = g
+        arm._cmd(np.array(arm.last_cmd[:6], dtype=float))
+        time.sleep(0.03)
+        free.append(load(arm))
+    e0, sd = float(np.mean(free)), float(np.std(free))
+    thr = e0 + max(0.08, 3 * sd)
+    s0 = float(np.median([skin.magnitude() for _ in range(5)])) if skin is not None else None
+    above, why = 0, ""
     while g > 0.0:
         g = max(0.0, g - step)
         arm.grip = g
         arm._cmd(np.array(arm.last_cmd[:6], dtype=float))
-        time.sleep(0.07)
+        time.sleep(0.03)
+        e = load(arm)
         meas = float(arm.state7()[6])
-        e = gripper_effort(arm)
         sk = skin.magnitude() if skin is not None else None
-        why = (f"opening lags {(meas - g) * 95:.1f} mm" if meas - g > lag else
-               f"motor effort +{e - e0:.2f}" if e - e0 > eff_rise else
+        above = above + 1 if e > thr else 0
+        why = (f"motor load {e:.2f} (free {e0:.2f}+-{sd:.2f})" if above >= 2 else
+               f"opening lags {(meas - g) * 95:.1f} mm" if meas - g > lag else
                f"skin +{sk - s0:.0f}" if sk is not None and sk - s0 > skin_rise else "")
-        if not why:
-            continue
-        arm.grip = g = max(0.0, meas - preload)
+        if why and meas > 0.03:
+            break
+        if why:  # the fingers met each other: nothing there
+            return meas
+    else:
+        return float(arm.state7()[6])
+    touch = float(arm.state7()[6])
+    target = e0 + hold_load
+    print(f"   soft contact at {touch * 95:.1f} mm ({why}); settling the load at {target:.2f}")
+    ok = 0
+    for _ in range(40):  # load servo on the grip command
+        e = load(arm, 6)
+        if e > target + band:
+            g = min(1.0, g + step)  # squeezing too hard: open a little
+            ok = 0
+        elif e < target - band:
+            g = max(0.0, g - step / 2)  # lost the load: close a little
+            ok = 0
+        else:
+            ok += 1
+            if ok >= 3:
+                break
+        arm.grip = g
         arm._cmd(np.array(arm.last_cmd[:6], dtype=float))
-        time.sleep(0.35)
-        if blocked(arm) and meas > 0.03:  # stalled on the object, not the fingers meeting each other (~2-3 mm)
-            m = float(arm.state7()[6])
-            print(f"   soft contact at {m * 95:.1f} mm ({why}); holding {(m - g) * 95:.1f} mm past the touch")
-            return m
-        print(f"   ({why} at {meas * 95:.1f} mm, but the fingers did not stall - closing on)")
-    return float(arm.state7()[6])
+        time.sleep(0.05)
+    arm.free_load, arm.hold_load = e0, target
+    m = float(arm.state7()[6])
+    e = load(arm, 8)
+    good = blocked(arm, 0.0005) or abs(e - target) <= band
+    print(f"   grip check: opening {m * 95:.1f} mm ({(touch - m) * 95:+.1f} mm past the touch), load {e:.2f} "
+          f"(target {target:.2f}) -> " + ("OK, lifting" if good and e > e0 + 0.03 else "NO LOAD - not holding"))
+    return m if (good and e > e0 + 0.03) else 0.0
 
 
 def set_gripper_force(arm: "Arm", newtons: float) -> bool:
