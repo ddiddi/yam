@@ -115,6 +115,8 @@ FINGER_REACH = 0.081  # m: fingertip to the gripper housing's face, along the fi
 
 
 TOP_Z_MIN = 0.014  # m: a top grasp's fingertips never close lower (the side grasps run theirs at Z_TIP_MIN 1.2 cm)
+_TILTS_OK: tuple = ()  # the SIDE_TILTS whose fingers cross the current target low enough (make_plan)
+SIDE_TILTS: tuple = ()  # --side-tilt: side-grasp wrist tilts to try (rad from vertical), flattest first; () = SIDE_TILT
 SIDE_CROSS_MAX = 0.6  # a side grasp's fingers must cross the object's axis within its lower 60%
 SEAT_TIPS_ONLY = 9.9  # a SEAT_BACKOFF this large leaves no depth: the fingertips stop at the object's centre line
 SEAT_BACKOFFS = (0.0, 0.015, 0.03, SEAT_TIPS_ONLY)  # the last: only for what nothing deeper can take (a flat dish)  # m: full depth first, then these much shallower if full depth has no safe path
@@ -1183,7 +1185,8 @@ def pose_options(mode: str) -> list[tuple[float, float, float | None]]:
     if mode == "top":
         return [(float(np.pi + a), float(t), None)
                 for t in (0.0, 0.25, 0.45) for a in np.linspace(0, np.pi, 12, endpoint=False)]
-    return [(np.pi, SIDE_TILT, float(d)) for d in (0.0, 0.35, -0.35, 0.7, -0.7, 1.05, -1.05, 1.4, -1.4)]
+    tilts = _TILTS_OK or SIDE_TILTS or (SIDE_TILT,)
+    return [(np.pi, float(t), float(d)) for t in tilts for d in (0.0, 0.35, -0.35, 0.7, -0.7, 1.05, -1.05, 1.4, -1.4)]
 
 
 def solve_grasp(planner: AzPlanner, ws: Workspace, obj: Obj, mode: str, pick: tuple[float, float],
@@ -1430,8 +1433,12 @@ def _make_plan(objs: list[Obj], index: int, args: "Args", planner: AzPlanner) ->
                 # the fingers slope down to their tips (SIDE_TILT from vertical): at full depth they cross the
                 # object's axis this much higher than the tips - it must still be the object's lower part
                 half = obj.length / 2 if obj.long_axis is not None else obj.radius
-                cross = z_grasp + max(0.0, seat_depth(obj) - half) * np.cos(SIDE_TILT)
-                if cross > args.side_cross_max * obj.height:
+                global _TILTS_OK
+                tilts = SIDE_TILTS or (SIDE_TILT,)
+                rise = max(0.0, seat_depth(obj) - half)
+                _TILTS_OK = tuple(t for t in tilts if z_grasp + rise * np.cos(t) <= args.side_cross_max * obj.height)
+                cross = z_grasp + rise * np.cos(max(tilts))  # the flattest wrist crosses lowest
+                if not _TILTS_OK:
                     tried.append(f"side at {z_grasp * 100:.1f} cm: the fingers would cross the object at "
                                  f"{cross * 100:.1f} cm, above {args.side_cross_max:.0%} of its {obj.height * 100:.1f} cm")
                     continue
@@ -2131,6 +2138,74 @@ def brute_candidates(plan: Plan, planner: AzPlanner, centre) -> list[np.ndarray]
     return [p for _, p in sorted(pts, key=lambda t: t[0])]
 
 
+DISC_FULL = 0.008  # m: a round object is held across its diameter once the jaw is within this of it
+
+
+def centre_on_disc(plan: Plan, planner: AzPlanner, arm: Arm, args: "Args", xy: np.ndarray, z_h: float) -> None:
+    """A round object held across a chord - the jaw closed at w < its diameter - sits sqrt(r^2 - (w/2)^2)
+    off-centre, perpendicular to the jaw, and tips as it is lifted. Re-grasp shifted by that much: one side
+    first (then once more that way if the chord grew but is not full yet), else the other side. Ends on the
+    widest grasp found, so the jaw spans the diameter and the object is carried level."""
+    r = plan.obj.diameter / 2
+    jaw = planner.jaw_dir(tuple(xy), plan.yaw, plan.tilt, plan.az)[:2]
+    u = np.array([-jaw[1], jaw[0]]) / (np.linalg.norm(jaw) + 1e-9)
+    full = lambda w: w >= 2 * r - DISC_FULL  # noqa: E731
+    offc = lambda w: float(np.sqrt(max(r * r - (w / 2) ** 2, 0.0)))  # noqa: E731
+    at = np.array(xy, dtype=float)  # where the gripper is now
+
+    def regrasp(to: np.ndarray) -> float | None:
+        nonlocal at
+        try:
+            arm.set_grip(plan.open_grip, 0.8)
+            q, _, _ = planner.ik(at[0], at[1], z_h, np.array(arm.last_cmd[:6], dtype=float), plan.yaw, plan.tilt)
+            arm.glide(q, 0.6)
+            q, _, _ = planner.ik(to[0], to[1], z_h, q, plan.yaw, plan.tilt)
+            arm.glide(q, 0.7)
+            path, qq = [], q
+            for z in np.linspace(z_h, plan.z_grasp, 4)[1:]:
+                qq, _, _ = planner.ik(to[0], to[1], z, qq, plan.yaw, plan.tilt)
+                path.append(qq)
+            arm.glide_path(path, 1.0)
+            time.sleep(0.3)
+        except RuntimeError as e:
+            print(f"   (re-grasp at ({to[0]:+.3f}, {to[1]:+.3f}) unreachable: {e})")
+            return None
+        at = np.array(to, dtype=float)
+        grip_on_object(arm, args, plan.obj.grip_width)
+        w = float(arm.state7()[6]) * JAW_STROKE
+        print(f"   re-grasp at ({to[0]:+.3f}, {to[1]:+.3f}): across {w * 100:.1f} cm")
+        return w
+
+    w0 = float(arm.state7()[6]) * JAW_STROKE
+    if full(w0):
+        print(f"   held across {w0 * 100:.1f} cm of its {2 * r * 100:.1f} cm diameter: centred")
+        return
+    print(f"   held across a {w0 * 100:.1f} cm chord of a {2 * r * 100:.1f} cm disc: "
+          f"{offc(w0) * 100:.1f} cm off-centre - re-grasping centred")
+    tried = [(w0, np.array(xy, dtype=float))]
+    wa = regrasp(xy + offc(w0) * u)
+    if wa is not None:
+        tried.append((wa, at.copy()))
+        if full(wa):
+            return
+        if wa > w0 + 0.004:  # the right way, not far enough yet
+            wb = regrasp(at + offc(wa) * u)
+            if wb is not None:
+                tried.append((wb, at.copy()))
+                if full(wb):
+                    return
+    if max(t[0] for t in tried) <= w0 + 0.004:  # the other way
+        wc = regrasp(xy - offc(w0) * u)
+        if wc is not None:
+            tried.append((wc, at.copy()))
+            if full(wc):
+                return
+    w_best, xy_best = max(tried, key=lambda t: t[0])
+    if not np.allclose(xy_best, at):
+        w = regrasp(xy_best)
+        print(f"   back to the widest grasp ({w_best * 100:.1f} cm)")
+
+
 def brute_grasp(plan: Plan, planner: AzPlanner, arm: Arm, args: "Args", live=None) -> bool:
     """Try grasp spots until one holds: hover, one smooth descent to the grasp height, close. Holding -> done
     (the plan carries on from here). Closed on nothing -> open, rise, next spot. After a full grid, the object
@@ -2160,6 +2235,8 @@ def brute_grasp(plan: Plan, planner: AzPlanner, arm: Arm, args: "Args", live=Non
             if grip_on_object(arm, args, plan.obj.grip_width):
                 print(f"   try {n} at ({xy[0]:+.3f}, {xy[1]:+.3f}): HOLDING - "
                       f"{np.linalg.norm(xy - np.array(plan.pick)) * 100:.1f} cm from the camera estimate")
+                if plan.obj.long_axis is None and plan.obj.measured:
+                    centre_on_disc(plan, planner, arm, args, np.array(xy, dtype=float), z_h)
                 return True
             print(f"   try {n} at ({xy[0]:+.3f}, {xy[1]:+.3f}): nothing - next")
             arm.set_grip(plan.open_grip, 0.8)
@@ -2447,6 +2524,9 @@ class Args:
     depth: bool = True
     """First scene analysis with Depth Anything V2 Small (depth.py): metric heights and footprints from the
     detection camera, objects the background survey misses, and a height map the trajectory must clear."""
+    side_tilt: tuple[float, ...] = ()
+    """Side-grasp wrist tilts to try, in degrees from vertical, in order (e.g. 85 80 75 70 60 for a near-
+    horizontal pick of a flat object: the flatter the fingers, the lower they cross it). Default: 60."""
     soft: bool = False
     """Fragile object: close slowly and stop at the first touch (opening lag / motor effort / tactile skin),
     hold with only --soft-preload past it, cap the gripper force at --grip-force, and test the hold by a 5 mm
@@ -2878,7 +2958,8 @@ def stage_run(args: Args) -> None:
 
 
 def main(args: Args) -> None:
-    global JAW_ACROSS, MAX_OBJ_WIDTH
+    global JAW_ACROSS, MAX_OBJ_WIDTH, SIDE_TILTS
+    SIDE_TILTS = tuple(float(np.radians(t)) for t in args.side_tilt)
     if args.max_width is not None:
         MAX_OBJ_WIDTH = min(float(args.max_width), JAW_STROKE - 0.003)
     if args.jaw_across:
