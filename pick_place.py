@@ -2157,7 +2157,7 @@ def brute_grasp(plan: Plan, planner: AzPlanner, arm: Arm, args: "Args", live=Non
             except RuntimeError as e:
                 print(f"   try {n}: unreachable ({e})")
                 continue
-            if grip_on_object(arm, args):
+            if grip_on_object(arm, args, plan.obj.grip_width):
                 print(f"   try {n} at ({xy[0]:+.3f}, {xy[1]:+.3f}): HOLDING - "
                       f"{np.linalg.norm(xy - np.array(plan.pick)) * 100:.1f} cm from the camera estimate")
                 return True
@@ -2211,9 +2211,48 @@ def measure_disc(r: float, h: float) -> tuple[float, float] | None:
     return float(sol.x[0]), float(sol.x[1])
 
 
-def grip_on_object(arm: Arm, args: "Args") -> bool:
-    """Close until the fingers stall on the object. True if something is actually held."""
-    g = close_until_contact(arm, squeeze=args.squeeze)
+SKIN = None  # the tactile skin while a --tactile run is going (soft grasps use it to feel contact and slip)
+
+
+def secure_hold(arm: Arm, planner: AzPlanner, plan: Plan, args: "Args") -> None:
+    """After a soft close: lift 5 mm and check the fingers are still stalled on the object (if it slid out they
+    close onto their command). If it slipped - or the skin lost most of its pressure - set back down, tighten
+    0.5 mm and try again, so the grip only gets as firm as the object needs (at most 5 steps, 2.5 mm)."""
+    from pick_bottle import blocked
+    keep, planner.az = planner.az, plan.az
+    try:
+        cmd = np.array(arm.last_cmd[:6], dtype=float)
+        here = planner.fk_pos(cmd)
+        q_up, _, _ = planner.ik(here[0], here[1], here[2] + 0.005, cmd, plan.yaw, plan.tilt)
+        for k in range(5):
+            s_held = SKIN.magnitude() if SKIN is not None else None
+            arm.glide(q_up, 0.7)
+            time.sleep(0.4)
+            s_up = SKIN.magnitude() if SKIN is not None else None
+            slip = not blocked(arm) or (s_held is not None and s_held > 100 and s_up < 0.5 * s_held)
+            sk = "" if s_held is None else f", skin {s_held:.0f} -> {s_up:.0f}"
+            print(f"   hold test {k + 1}: fingers {'stalled' if blocked(arm) else 'NOT stalled'}{sk}: "
+                  + ("slipping - back down, tighten 0.5 mm" if slip else "held"))
+            if not slip:
+                return
+            arm.glide(cmd, 0.7)
+            arm.grip = max(0.0, arm.grip - args.soft_preload)
+            arm._cmd(cmd)
+            time.sleep(0.4)
+        arm.glide(q_up, 0.7)
+    finally:
+        planner.az = keep
+
+
+def grip_on_object(arm: Arm, args: "Args", width: float | None = None) -> bool:
+    """Close until the fingers stall on the object. True if something is actually held. --soft: stop at the
+    first touch (opening lag, motor effort or the skin) and hold with a ~0.5 mm preload."""
+    if args.soft:
+        from pick_bottle import soft_close
+        start = None if width is None else min(arm.grip, (width + 0.01) / JAW_STROKE)
+        g = soft_close(arm, start=start, preload=args.soft_preload, skin=SKIN)
+    else:
+        g = close_until_contact(arm, squeeze=args.squeeze)
     holding = g > 0.06
     print(f"   gripper at {g:.2f} ({g * JAW_STROKE * 100:.1f} cm): "
           f"{'holding the object' if holding else 'CLOSED ON NOTHING'}")
@@ -2324,6 +2363,8 @@ def _run_legs(plan: Plan, planner: AzPlanner, arm: Arm, cam: LiveCamera | None, 
             holding, carry = True, carried_points(plan.obj, plan.z_grasp, grasp_ahead(planner, plan))
             arm.holding = True
             ws.aim(None)
+            if args.soft:
+                secure_hold(arm, planner, plan, args)
         elif wp.kind == "close":
             got = False
             for attempt in range(1, GRASP_TRIES + 1):
@@ -2331,7 +2372,7 @@ def _run_legs(plan: Plan, planner: AzPlanner, arm: Arm, cam: LiveCamera | None, 
                     centre_in_jaw(plan, planner, arm, ws, f"{i}_{attempt}")
                 except RuntimeError as e:
                     print(f"   (jaw check skipped: {e})")
-                if grip_on_object(arm, args):
+                if grip_on_object(arm, args, plan.obj.grip_width):
                     got = True
                     break
                 if attempt < GRASP_TRIES:
@@ -2354,6 +2395,8 @@ def _run_legs(plan: Plan, planner: AzPlanner, arm: Arm, cam: LiveCamera | None, 
             holding, carry = True, carried_points(plan.obj, plan.z_grasp, grasp_ahead(planner, plan))
             arm.holding = True
             ws.aim(None)
+            if args.soft:
+                secure_hold(arm, planner, plan, args)
         elif wp.kind == "hold":
             time.sleep(wp.seconds)
         elif wp.kind in ("rest", "pose"):
@@ -2404,6 +2447,14 @@ class Args:
     depth: bool = True
     """First scene analysis with Depth Anything V2 Small (depth.py): metric heights and footprints from the
     detection camera, objects the background survey misses, and a height map the trajectory must clear."""
+    soft: bool = False
+    """Fragile object: close slowly and stop at the first touch (opening lag / motor effort / tactile skin),
+    hold with only --soft-preload past it, cap the gripper force at --grip-force, and test the hold by a 5 mm
+    lift, tightening 0.5 mm at a time only if it slips."""
+    soft_preload: float = 0.005
+    """Gripper units (x 9.5 cm) closed past the first touch in a soft grasp: 0.005 = ~0.5 mm."""
+    grip_force: float | None = None
+    """Cap the gripper's blocked force (N; the driver default is 50). --soft sets 10 unless given."""
     brute: bool = False
     """Top grasp: instead of trusting the estimate, try grasp spots on a grid around it (nearest first) until
     one holds; two rounds, re-measuring the object in between. For a Petri dish in a jaw it barely fits."""
@@ -2763,6 +2814,11 @@ def stage_run(args: Args) -> None:
         rec = EpisodeRecorder(Path(args.record), cams, arm.state7, lambda: arm.last_cmd, args.task, args.fps)
         rec.start()
         print(f"recording to {args.record} at {args.fps} fps")
+    force = args.grip_force if args.grip_force is not None else (10.0 if args.soft else None)
+    if force is not None:
+        from pick_bottle import set_gripper_force
+        print(f"gripper force capped at {force:.0f} N" if set_gripper_force(arm, force)
+              else "(could not cap the gripper force: no limiter in this driver)")
     grip_log = skin = None
     if args.tactile:  # the gripper's skin next to its motor, on one clock (tactile.py)
         from tactile import GripLog, TactileSkin
@@ -2772,6 +2828,8 @@ def stage_run(args: Args) -> None:
             grip_log = GripLog(skin, arm.robot.get_observations, lambda: float(arm.last_cmd[6]),
                                lambda: str(live.doc.get("phase", "")))
             grip_log.start()
+            global SKIN
+            SKIN = skin
             print(f"tactile skin on {skin.port}: {skin.width} channels, logging with the gripper motor")
         except Exception as e:  # the pick does not depend on the skin
             print(f"!! tactile skin not logged: {e}")

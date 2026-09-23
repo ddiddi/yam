@@ -596,6 +596,68 @@ def close_until_contact(arm: Arm, squeeze: float = 0.08, step: float = 0.015, la
     return float(arm.state7()[6])
 
 
+def gripper_effort(arm: "Arm") -> float:
+    try:
+        return float(np.abs(arm.robot.get_observations()["gripper_eff"][0]))
+    except Exception:
+        return 0.0
+
+
+def blocked(arm: "Arm", margin: float = 0.002) -> bool:
+    """The fingers are stalled on something: the measured opening stays above the commanded one."""
+    return float(arm.state7()[6]) - arm.grip > margin
+
+
+def soft_close(arm: "Arm", start: float | None = None, preload: float = 0.005, step: float = 0.004,
+               lag: float = 0.012, eff_rise: float = 0.25, skin=None, skin_rise: float = 60.0) -> float:
+    """Close gently on a fragile object: fast to `start` (a little wider than the object), then 0.4 mm steps,
+    pausing at the first hint of contact - the opening lagging the command by ~1 mm, the motor effort rising,
+    or the tactile skin rising above its resting level - and commanding only `preload` (~0.5 mm) past the
+    touch. A hint only counts if the fingers then stay stalled short of that command (effort and skin drift
+    on their own; free-motion effort reaches 0.3-0.6 in the logs); otherwise the slow close carries on.
+    close_until_contact waits for a 4.8 mm lag and squeezes ~4.8 mm more: it held a 9.0 cm dish at 7.8 cm."""
+    if start is not None and start < arm.grip:
+        arm.set_grip(max(0.0, start), 0.8)
+    time.sleep(0.3)
+    e0 = float(np.median([gripper_effort(arm) for _ in range(7)]))
+    s0 = float(np.median([skin.magnitude() for _ in range(7)])) if skin is not None else None
+    g = arm.grip
+    while g > 0.0:
+        g = max(0.0, g - step)
+        arm.grip = g
+        arm._cmd(np.array(arm.last_cmd[:6], dtype=float))
+        time.sleep(0.07)
+        meas = float(arm.state7()[6])
+        e = gripper_effort(arm)
+        sk = skin.magnitude() if skin is not None else None
+        why = (f"opening lags {(meas - g) * 95:.1f} mm" if meas - g > lag else
+               f"motor effort +{e - e0:.2f}" if e - e0 > eff_rise else
+               f"skin +{sk - s0:.0f}" if sk is not None and sk - s0 > skin_rise else "")
+        if not why:
+            continue
+        arm.grip = g = max(0.0, meas - preload)
+        arm._cmd(np.array(arm.last_cmd[:6], dtype=float))
+        time.sleep(0.35)
+        if blocked(arm):
+            m = float(arm.state7()[6])
+            print(f"   soft contact at {m * 95:.1f} mm ({why}); holding {(m - g) * 95:.1f} mm past the touch")
+            return m
+        print(f"   ({why} at {meas * 95:.1f} mm, but the fingers did not stall - closing on)")
+    return float(arm.state7()[6])
+
+
+def set_gripper_force(arm: "Arm", newtons: float) -> bool:
+    """Lower the driver's blocked-gripper force limit (i2rt GripperForceLimiter, 50 N by default) for this run."""
+    from functools import partial
+    lim = getattr(arm.robot, "_gripper_force_limiter", None)
+    if lim is None:
+        return False
+    lim.max_force = float(newtons)
+    lim.gripper_force_torque_map = partial(lim.gripper_force_torque_map, gripper_force=float(newtons))
+    arm.robot._limit_gripper_force = float(newtons)
+    return True
+
+
 def visual_correct(
     arm: Arm, planner: Planner, cam: LiveCamera, H: np.ndarray, target: np.ndarray, yaw: float, tilt: float, max_iter: int = 3
 ) -> np.ndarray:
