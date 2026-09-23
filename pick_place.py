@@ -1183,8 +1183,10 @@ def pose_options(mode: str) -> list[tuple[float, float, float | None]]:
     wrist-pitch limit close to the base. A side grasp instead needs the direction the fingers come in
     from, which is searched around the radial one."""
     if mode == "top":
+        # the jaw line repeats every half turn, but the wrist joint does not: a yaw past its limit can be
+        # reached half a turn round (a tube at 156 deg only fitted at yaw 135, not 315), so try the full turn
         return [(float(np.pi + a), float(t), None)
-                for t in (0.0, 0.25, 0.45) for a in np.linspace(0, np.pi, 12, endpoint=False)]
+                for t in (0.0, 0.25, 0.45) for a in np.linspace(0, 2 * np.pi, 24, endpoint=False)]
     tilts = _TILTS_OK or SIDE_TILTS or (SIDE_TILT,)
     return [(np.pi, float(t), float(d)) for t in tilts for d in (0.0, 0.35, -0.35, 0.7, -0.7, 1.05, -1.05, 1.4, -1.4)]
 
@@ -2301,6 +2303,94 @@ def measure_disc(r: float, h: float) -> tuple[float, float] | None:
 SKIN = None  # the tactile skin while a --tactile run is going (soft grasps use it to feel contact and slip)
 
 
+def site_rot(planner: AzPlanner, q6: np.ndarray) -> np.ndarray:
+    """World rotation of the grasp site (the gripper frame) at joints q6."""
+    m, d = planner.model, planner.data
+    d.qpos[:] = 0
+    d.qpos[:6] = q6
+    mujoco.mj_kinematics(m, d)
+    sid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_SITE, "grasp_site")
+    return d.site_xmat[sid].reshape(3, 3).copy()
+
+
+def _axis_rot(axis: np.ndarray, th: float) -> np.ndarray:
+    a = axis / np.linalg.norm(axis)
+    K = np.array([[0, -a[2], a[1]], [a[2], 0, -a[0]], [-a[1], a[0], 0]])
+    return np.eye(3) + np.sin(th) * K + (1 - np.cos(th)) * K @ K
+
+
+def pour_path(planner: AzPlanner, ws: "Workspace", q_start: np.ndarray, open_dir: np.ndarray, reach: float,
+              over: np.ndarray, lip_z: float, tilt_max: float, dish_r: float) -> tuple[list, int] | None:
+    """Joint path for pouring from a held tube: its axis runs `reach` m from the grasp site to the open end,
+    along `open_dir` (world, at the grasp). Level first with the lip over `over` at `lip_z`, then rotate the
+    gripper about its jaw axis so the open end tips down while the lip stays put (tilt_max rad), then back
+    to level. Tries wrist turns about the vertical until IK and the table/dish checks pass. Returns
+    (path, index of the full tilt) or None."""
+    R0 = site_rot(planner, q_start)
+    v_loc = R0.T @ (open_dir / np.linalg.norm(open_dir))
+    jaw = planner.jaw_local
+    lip = np.array([over[0], over[1], lip_z])
+    for phi in (0.0, 0.5, -0.5, 1.0, -1.0, 1.5, -1.5, 2.0, -2.0, 2.6, -2.6, 3.14):
+        Rl = _axis_rot(np.array([0, 0, 1.0]), phi) @ R0
+        # the tilt sign that brings the open end DOWN
+        sgn = 1.0 if (Rl @ _axis_rot(jaw, 0.5) @ v_loc)[2] < 0 else -1.0
+        path, q, ok = [], np.array(q_start[:6], dtype=float), True
+        ths = list(np.linspace(0, tilt_max, 10)) + list(np.linspace(tilt_max, 0, 6))[1:]
+        for th in ths:
+            R = Rl @ _axis_rot(jaw, sgn * th)
+            T = np.eye(4)
+            T[:3, :3] = R
+            T[:3, 3] = lip - R @ v_loc * reach
+            q0 = np.zeros(planner.model.nq)
+            q0[:6] = q
+            good, qq = planner.kin.ik(T, "grasp_site", init_q=q0, limits=planner.limits, max_iters=400,
+                                      pos_threshold=2e-3, ori_threshold=3e-2)
+            if not good:
+                ok = False
+                break
+            qq = np.array(qq[:6])
+            if path and np.max(np.abs(qq - path[-1])) > 0.6:  # IK jumped branch mid-pour
+                ok = False
+                break
+            pts = ws.points(qq)
+            near = np.linalg.norm(pts[:, :2] - over[:2], axis=1) < dish_r + 0.015
+            if pts[:, 2].min() < 0.015 or (near.any() and pts[near, 2].min() < 0.035):
+                ok = False
+                break
+            path.append(qq)
+            q = qq
+        if ok:
+            # the move into the pour from where the arm is, swept too
+            gap, who, zmin = ws.scan(np.array(q_start[:6]), path[0])
+            if zmin < 0.015:
+                continue
+            print(f"   pour: wrist turned {np.degrees(phi):+.0f} deg, tilt to {np.degrees(tilt_max):.0f} deg, "
+                  f"lip held at ({lip[0]:+.3f}, {lip[1]:+.3f}, {lip[2]:.3f})")
+            return path, 9
+    return None
+
+
+def do_pour(arm: Arm, planner: AzPlanner, ws: "Workspace", plan: Plan, args: "Args") -> None:
+    """--pour-over: pour the held tube into the dish, then come back to the lift pose so the plan carries on."""
+    over = np.array([float(v) for v in args.pour_over.split(",")[:2]])
+    tube_open = np.array([float(v) for v in args.pour_open_end.split(",")[:2]])
+    d = tube_open - np.asarray(plan.pick)
+    open_dir = np.r_[d, 0.0]
+    reach = float(np.linalg.norm(d))
+    q_lift = np.array(arm.last_cmd[:6], dtype=float)
+    got = pour_path(planner, ws, q_lift, open_dir, reach, over, args.pour_lip_z, np.radians(args.pour_tilt), 0.045)
+    if got is None:
+        print("   !! pour: no reachable, collision-free pouring pose - skipping the pour")
+        return
+    path, full = got
+    arm.glide_path([path[0]], 3.0)  # level, lip over the dish
+    arm.glide_path(path[1:full + 1], 3.5)  # tip it slowly
+    print(f"   pouring: holding {args.pour_hold:.1f} s")
+    time.sleep(args.pour_hold)
+    arm.glide_path(path[full + 1:], 2.5)  # back to level
+    arm.glide_path([q_lift], 3.0)  # back to the lift pose
+
+
 def secure_hold(arm: Arm, planner: AzPlanner, plan: Plan, args: "Args") -> None:
     """After a soft close: lift 5 mm and read the gripper motor load. Still loaded (the object's weight and the
     hold are on the fingers) -> carry on. Load gone, or the skin lost most of its pressure -> it is slipping:
@@ -2492,6 +2582,8 @@ def _run_legs(plan: Plan, planner: AzPlanner, arm: Arm, cam: LiveCamera | None, 
             if args.soft:
                 secure_hold(arm, planner, plan, args)
         elif wp.kind == "hold":
+            if args.pour_over and holding:
+                do_pour(arm, planner, ws, plan, args)
             time.sleep(wp.seconds)
         elif wp.kind in ("rest", "pose"):
             goto_joint(arm, planner, np.array(REST if wp.kind == "rest" else wp.q), wp.seconds)
@@ -2544,6 +2636,16 @@ class Args:
     side_tilt: tuple[float, ...] = ()
     """Side-grasp wrist tilts to try, in degrees from vertical, in order (e.g. 85 80 75 70 60 for a near-
     horizontal pick of a flat object: the flatter the fingers, the lower they cross it). Default: 60."""
+    pour_over: str = ""
+    """"x,y": after the lift, pour the held tube over this point (e.g. the Petri dish centre)."""
+    pour_open_end: str = ""
+    """"x,y" of the tube's open end as it lies on the table (so the pour tips that end down)."""
+    pour_lip_z: float = 0.06
+    """Height (m) the tube's lip is held at while pouring (the dish top is 1.5 cm)."""
+    pour_tilt: float = 100.0
+    """Pour tilt, degrees from level (90 = the tube vertical, open end down)."""
+    pour_hold: float = 2.5
+    """Seconds to hold the full tilt."""
     soft: bool = False
     """Fragile object: close slowly and stop at the first touch (opening lag / motor effort / tactile skin),
     hold with only --soft-preload past it, cap the gripper force at --grip-force, and test the hold by a 5 mm
