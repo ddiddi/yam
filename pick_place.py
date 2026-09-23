@@ -746,6 +746,9 @@ class Workspace:
             self.tips.append(np.full(len(verts), body.startswith("tip")))
         # the jaw is open for most of the approach, so sweep it open: the tips then stand 4.75 cm out
         # on either side, which is the widest the gripper ever is
+        # each fingertip's slide (m): fully open unless told otherwise. A tilted wrist hangs one tip lower the
+        # wider the jaw is, so legs travelled with the jaw only part-open are checked at that opening
+        self.jaw_half = 0.0475
         self.is_tip = np.concatenate(self.tips)  # aligned with points(): True for fingertip vertices
         self.jaw_qpos = [m.jnt_qposadr[mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_JOINT, j)]
                          for j in ("joint7", "joint8")
@@ -756,7 +759,7 @@ class Workspace:
         d.qpos[:] = 0
         d.qpos[:6] = q6
         for a in self.jaw_qpos:
-            d.qpos[a] = 0.0475
+            d.qpos[a] = self.jaw_half
         mujoco.mj_kinematics(self.planner.model, d)
         return [v @ d.geom_xmat[gi].reshape(3, 3).T + d.geom_xpos[gi] for gi, v in self.geoms]
 
@@ -765,7 +768,7 @@ class Workspace:
         d.qpos[:] = 0
         d.qpos[:6] = q6
         for a in self.jaw_qpos:
-            d.qpos[a] = 0.0475
+            d.qpos[a] = self.jaw_half
         mujoco.mj_kinematics(self.planner.model, d)
         return np.concatenate([v @ d.geom_xmat[gi].reshape(3, 3).T + d.geom_xpos[gi] for gi, v in self.geoms])
 
@@ -877,10 +880,13 @@ def grasp_ahead(planner: "AzPlanner", plan: "Plan") -> np.ndarray:
     return (SLIDE_SHORT - side_deep(plan.obj, zg)) * u
 
 
+TABLE_SLACK = 0.004  # --table-slack: how far below the commanded fingertip height any part may go on a low leg
+
+
 def table_floor(z_from: float, z_to: float) -> float:
     """Lowest the arm's meshes may reach on a leg: 1 cm normally, and just under the commanded
     fingertip height when that leg deliberately goes low (a flat object is grasped at ~1.2 cm)."""
-    return min(0.01, min(z_from, z_to) - 0.004)
+    return min(0.01, min(z_from, z_to) - TABLE_SLACK)
 
 
 def follow(arm: Arm, planner: AzPlanner, ws: "Workspace", qs: list, seconds: float, carry=None,
@@ -890,6 +896,7 @@ def follow(arm: Arm, planner: AzPlanner, ws: "Workspace", qs: list, seconds: flo
     from the MEASURED joints, because that is where `Arm.glide` starts; after `settle` the commanded pose
     is deliberately off (it compensates sag) and the model puts it lower than the arm really is."""
     q = arm.q()
+    ws.jaw_half = float(np.clip(arm.grip, 0.0, 1.0)) * JAW_STROKE / 2  # checked at the jaw's actual opening
     for q_next in qs:  # the whole leg is re-checked first, then travelled as one smooth motion
         gap, who, zmin = ws.scan(q, np.asarray(q_next, dtype=float), carry)
         if floor_z is not None and zmin < floor_z:
@@ -920,6 +927,7 @@ def move_line(arm: Arm, planner: AzPlanner, ws: "Workspace", xyz, yaw: float, ti
         q = arm.q()
     n = max(1, int(np.linalg.norm(p1 - p0) / step))
     floor = table_floor(p0[2], p1[2])
+    ws.jaw_half = float(np.clip(arm.grip, 0.0, 1.0)) * JAW_STROKE / 2
     path = []
     for i in range(1, n + 1):  # solved and checked end to end first, then one smooth motion
         p = p0 + (p1 - p0) * i / n
@@ -1001,6 +1009,7 @@ class WP:
     settle: bool = False
     q: np.ndarray | None = None  # for kind "pose": the joint target, xyz being only its FK position
     qs: list | None = None  # the joint path `validate` checked for this leg; `execute` follows exactly this
+    release: bool = False  # this waypoint lets go of the object (its grip may be only part-open)
 
 
 @dataclass
@@ -1101,8 +1110,10 @@ def build_waypoints(planner: AzPlanner, obj: Obj, mode: str, yaw: float, tilt: f
         ] + look2 + [
             WP("carry to the place point", (px, py, z_travel), 3.5),
             WP("lower", (px, py, z_grasp), 3.0, settle=True),
-            WP("release", (px, py, z_grasp), 1.5, grip=GRIP_OPEN),
-            WP("clear of the table", (px, py, z_travel), 2.5),
+            # let go only as wide as the pick opening: a tilted wrist opened fully this low puts a fingertip
+            # into the table. It opens fully once it is up.
+            WP("release", (px, py, z_grasp), 1.5, grip=open_grip, release=True),
+            WP("clear of the table", (px, py, z_travel), 2.5, grip=GRIP_OPEN),
         ]
     wps.append(WP("fold back to ready", ready, 3.5, kind="pose", q=np.array(READY)))
     if park == "rest":
@@ -1129,7 +1140,10 @@ def validate(planner: AzPlanner, ws: Workspace, plan: Plan, q_start: np.ndarray,
 
 
 def _walk(planner, ws, plan, q, step, wps, holding, carry, worst, who, legs, low):
+    part_open = plan.open_grip * JAW_STROKE / 2  # the jaw's slide per tip until it is opened fully
+    full_open = False
     for wp in (plan.waypoints if wps is None else wps):
+        ws.jaw_half = 0.0475 if (full_open or wp.kind in ("rest", "pose")) else max(part_open, 0.0)
         if wp.kind == "close":
             holding = True
             ws.aim(None)
@@ -1162,6 +1176,8 @@ def _walk(planner, ws, plan, q, step, wps, holding, carry, worst, who, legs, low
                 q = q_next
             wp.qs = path
         if wp.grip is not None and wp.grip >= GRIP_OPEN - 1e-6:
+            full_open = True
+        if wp.release or (wp.grip is not None and wp.grip >= GRIP_OPEN - 1e-6):
             if holding:
                 ws.aim(plan.obj, plan.place)  # released: it stands at the place point from here on
             holding = False
@@ -1876,7 +1892,7 @@ def view_gate(plan: Plan, planner: AzPlanner, ws: Workspace, q_start: np.ndarray
                 swept.append(pts[::3])
                 bad.append(b[::3])
             q = q_next
-        if wp.grip is not None and wp.grip >= GRIP_OPEN - 1e-6 and holding:
+        if (wp.release or (wp.grip is not None and wp.grip >= GRIP_OPEN - 1e-6)) and holding:
             holding, placed = False, True
     swept, bad = np.vstack(swept), np.concatenate(bad)
     ok = not bad.any()
@@ -2606,7 +2622,7 @@ def _run_legs(plan: Plan, planner: AzPlanner, arm: Arm, cam: LiveCamera | None, 
                     print(f"   (sag compensation skipped: {e})")
             if wp.grip is not None:
                 arm.set_grip(wp.grip, 1.5)
-                if wp.grip >= GRIP_OPEN - 1e-6:
+                if (wp.release or wp.grip >= GRIP_OPEN - 1e-6) and holding:
                     holding, carry = False, None
                     arm.holding = False
                     ws.aim(plan.obj, plan.place)
@@ -2636,6 +2652,12 @@ class Args:
     side_tilt: tuple[float, ...] = ()
     """Side-grasp wrist tilts to try, in degrees from vertical, in order (e.g. 85 80 75 70 60 for a near-
     horizontal pick of a flat object: the flatter the fingers, the lower they cross it). Default: 60."""
+    cam_moved_px: float = 3.0
+    """How far (px) a camera's fixed background may shift before it counts as moved (~0.7 mm/px at the table)."""
+    table_slack: float = 0.004
+    """How far (m) below the commanded fingertip height any part of the arm may reach on a low leg. A slightly
+    tilted wrist hangs the finger edges ~6 mm below the fingertip point: 0.007 lets a 1.6 cm tube be taken at
+    1.0 cm (lowest part 4 mm above the table)."""
     pour_over: str = ""
     """"x,y": after the lift, pour the held tube over this point (e.g. the Petri dish centre)."""
     pour_open_end: str = ""
@@ -3080,7 +3102,9 @@ def stage_run(args: Args) -> None:
 
 
 def main(args: Args) -> None:
-    global JAW_ACROSS, MAX_OBJ_WIDTH, SIDE_TILTS
+    global JAW_ACROSS, MAX_OBJ_WIDTH, SIDE_TILTS, TABLE_SLACK, CAM_MOVED_PX
+    CAM_MOVED_PX = float(args.cam_moved_px)
+    TABLE_SLACK = float(args.table_slack)
     SIDE_TILTS = tuple(float(np.radians(t)) for t in args.side_tilt)
     if args.max_width is not None:
         MAX_OBJ_WIDTH = min(float(args.max_width), JAW_STROKE - 0.003)
