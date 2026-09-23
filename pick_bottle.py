@@ -608,6 +608,9 @@ def blocked(arm: "Arm", margin: float = 0.002) -> bool:
     return float(arm.state7()[6]) - arm.grip > margin
 
 
+FREE_LOAD_MAX = 0.08  # free-closing gripper load seen in the logs: 0.00-0.08
+
+
 def load(arm: "Arm", n: int = 4, dt: float = 0.012) -> float:
     """Gripper motor load: |effort| averaged over n reads (single reads jitter by +-0.1 while moving)."""
     v = []
@@ -639,7 +642,8 @@ def soft_close(arm: "Arm", start: float | None = None, preload: float = 0.005, s
         arm._cmd(np.array(arm.last_cmd[:6], dtype=float))
         time.sleep(0.03)
         free.append(load(arm))
-    e0, sd = float(np.mean(free)), float(np.std(free))
+    # the first reads can include the fingers leaving their fully-open stop (0.17 once): cap the free load
+    e0, sd = min(float(np.median(free)), FREE_LOAD_MAX), min(float(np.std(free)), 0.04)
     thr = e0 + max(0.08, 3 * sd)
     s0 = float(np.median([skin.magnitude() for _ in range(5)])) if skin is not None else None
     above, why = 0, ""
@@ -665,10 +669,10 @@ def soft_close(arm: "Arm", start: float | None = None, preload: float = 0.005, s
     target = e0 + hold_load
     print(f"   soft contact at {touch * 95:.1f} mm ({why}); settling the load at {target:.2f}")
     ok = 0
-    for _ in range(40):  # load servo on the grip command
+    for _ in range(60):  # load servo on the grip command
         e = load(arm, 6)
         if e > target + band:
-            g = min(1.0, g + step)  # squeezing too hard: open a little
+            g = min(1.0, g + step * (2 if e > target + 3 * band else 1))  # squeezing too hard: open
             ok = 0
         elif e < target - band:
             g = max(0.0, g - step / 2)  # lost the load: close a little
@@ -683,9 +687,21 @@ def soft_close(arm: "Arm", start: float | None = None, preload: float = 0.005, s
     arm.free_load, arm.hold_load = e0, target
     m = float(arm.state7()[6])
     e = load(arm, 8)
-    good = blocked(arm, 0.0005) or abs(e - target) <= band
+    good = abs(e - target) <= band  # the load decides: stalled fingers alone may be squeezing too hard
     print(f"   grip check: opening {m * 95:.1f} mm ({(touch - m) * 95:+.1f} mm past the touch), load {e:.2f} "
           f"(target {target:.2f}) -> " + ("OK, lifting" if good and e > e0 + 0.03 else "NO LOAD - not holding"))
+    if not good and e > target + band:  # still too hard after the servo: open to the target load, then accept
+        for _ in range(20):
+            g = min(1.0, g + step)
+            arm.grip = g
+            arm._cmd(np.array(arm.last_cmd[:6], dtype=float))
+            time.sleep(0.05)
+            e = load(arm, 6)
+            if e <= target + band:
+                good = True
+                print(f"   eased to load {e:.2f} at {float(arm.state7()[6]) * 95:.1f} mm")
+                break
+        m = float(arm.state7()[6])
     return m if (good and e > e0 + 0.03) else 0.0
 
 
