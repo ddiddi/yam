@@ -2462,13 +2462,14 @@ HOLD_TEST_LIFT = 0.02  # m: the hold test lift (5 mm passed a dish that slid out
 HOLD_SPEED = 1.0  # --soft: the arm never moves faster than this while it holds the object (a 2x lift dropped the dish)
 
 
-def secure_hold(arm: Arm, planner: AzPlanner, plan: Plan, args: "Args") -> None:
+def secure_hold(arm: Arm, planner: AzPlanner, plan: Plan, args: "Args") -> bool:
+    """False when the grasp is lost (the jaw is empty): the caller stops instead of carrying nothing."""
     arm.speed_free = getattr(arm, "speed", 1.0)  # restored at the release
     arm.speed = min(arm.speed_free, HOLD_SPEED)
-    _secure_hold(arm, planner, plan, args)
+    return _secure_hold(arm, planner, plan, args) is not False
 
 
-def _secure_hold(arm: Arm, planner: AzPlanner, plan: Plan, args: "Args") -> None:
+def _secure_hold(arm: Arm, planner: AzPlanner, plan: Plan, args: "Args") -> bool | None:
     """After a soft close: lift 5 mm and read the gripper motor load. Still loaded (the object's weight and the
     hold are on the fingers) -> carry on. Load gone, or the skin lost most of its pressure -> it is slipping:
     set it back down and raise the held load by 0.05 (never past 3x the first target)."""
@@ -2495,7 +2496,7 @@ def _secure_hold(arm: Arm, planner: AzPlanner, plan: Plan, args: "Args") -> None
             if e < free + 0.03 and (s_up is None or s_up < 0.8 * (s_held or 1e9) or k > 0):
                 print("   !! the jaw is empty (load at its free level): the grasp was lost - not squeezing harder")
                 arm.glide(cmd, 0.7)
-                return
+                return False
             arm.glide(cmd, 0.7)
             target = min(target + 0.05, free + args.grip_load + 0.10)  # never near the load that flexed the dish
             for _ in range(30):  # close in small steps until the load reaches the new target
@@ -2634,8 +2635,11 @@ def _run_legs(plan: Plan, planner: AzPlanner, arm: Arm, cam: LiveCamera | None, 
             holding, carry = True, carried_points(plan.obj, plan.z_grasp, grasp_ahead(planner, plan))
             arm.holding = True
             ws.aim(None)
-            if args.soft:
-                secure_hold(arm, planner, plan, args)
+            if args.soft and not secure_hold(arm, planner, plan, args):
+                arm.speed = getattr(arm, "speed_free", arm.speed)
+                arm.holding = False
+                bail(arm, planner, ws, plan, False, "the grasp was lost at the hold test (empty jaw)")
+                return False
         elif wp.kind == "close":
             got = False
             for attempt in range(1, GRASP_TRIES + 1):
@@ -2666,8 +2670,11 @@ def _run_legs(plan: Plan, planner: AzPlanner, arm: Arm, cam: LiveCamera | None, 
             holding, carry = True, carried_points(plan.obj, plan.z_grasp, grasp_ahead(planner, plan))
             arm.holding = True
             ws.aim(None)
-            if args.soft:
-                secure_hold(arm, planner, plan, args)
+            if args.soft and not secure_hold(arm, planner, plan, args):
+                arm.speed = getattr(arm, "speed_free", arm.speed)
+                arm.holding = False
+                bail(arm, planner, ws, plan, False, "the grasp was lost at the hold test (empty jaw)")
+                return False
         elif wp.kind == "hold":
             if args.pour_over and holding:
                 do_pour(arm, planner, ws, plan, args)
@@ -2724,7 +2731,7 @@ def _run_legs(plan: Plan, planner: AzPlanner, arm: Arm, cam: LiveCamera | None, 
                 from pick_bottle import load
                 e, free = load(arm, 10), getattr(arm, "free_load", 0.0)
                 tgt = getattr(arm, "hold_load", free + args.grip_load)
-                if e < free + 0.5 * (tgt - free):  # half-way to the hold load: an empty jaw reads ~free
+                if e < free + 0.04:  # dropped: 0.06-0.07 over a free 0.03-0.05; held and resting on the table: 0.11-0.15
                     print(f"!! at the place point the gripper load is {e:.2f} (free {free:.2f}): the object is not in "
                           "the jaw - it was dropped on the way")
                     arm.speed = getattr(arm, "speed_free", arm.speed)
