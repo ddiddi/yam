@@ -1203,6 +1203,8 @@ class Plan:
     station: dict | None = None  # --station: the place point is the scale top; the object then goes back to `pick`
     weigh: float = 0.0  # --station: seconds the object sits on the scale, the gripper clear of it
     pour: dict | None = None  # --pour-oz: {"oz", "base_z", "tip"}; the place point is where the bottle axis pours from
+    stage: str = "cycle"  # --station-stage: "cycle" (on, weigh, back), "on" (set it on the scale, weigh, leave it), "off"
+    # (it already stands on the scale: take it off and set it down at `pick`)
 
     def to_json(self) -> dict:
         return {
@@ -1226,7 +1228,8 @@ class Plan:
 def build_waypoints(planner: AzPlanner, obj: Obj, mode: str, yaw: float, tilt: float, az: float | None,
                     pick: tuple[float, float], place: tuple[float, float], z_grasp: float, z_travel: float,
                     open_grip: float, hold: float, pause: float = 0.0, park: str = "rest",
-                    station: dict | None = None, weigh: float = 0.0, pour: dict | None = None) -> list[WP]:
+                    station: dict | None = None, weigh: float = 0.0, pour: dict | None = None,
+                    stage: str = "cycle") -> list[WP]:
     """With `station`: the place point is on the scale top (every place height rises by its top_z); after the
     release the gripper backs off and waits `weigh` s, takes the object again exactly as it let go of it, and
     sets it down back where it was picked (`at` on each release says where the object then stands)."""
@@ -1339,10 +1342,21 @@ def build_waypoints(planner: AzPlanner, obj: Obj, mode: str, yaw: float, tilt: f
                 WP("release it back", (x, y, z_grasp), 1.5, grip=open_grip, release=True, at=tuple(pick)),
                 WP("clear of the table", (x, y, z_travel), 2.5, grip=GRIP_OPEN),
             ]
+    if station and stage != "cycle":
+        iw = next(i for i, w in enumerate(wps) if w.label.startswith("weigh"))
+        if stage == "on":  # leave it on the scale once weighed
+            wps = wps[:iw + 1]
+        else:  # "off": it already stands on the scale - go straight to it, then the second half of the cycle
+            wps = [wps[0], WP("above it on the scale", (px, py, z_travel), 4.0, kind="joint")] + wps[iw + 1:]
     wps.append(WP("fold back to ready", ready, 3.5, kind="pose", q=np.array(READY)))
     if park == "rest":
         wps.append(WP("return to rest", (0.0, 0.0, 0.0), 3.0, kind="rest"))
     return wps
+
+
+def starts_placed(plan: "Plan") -> bool:
+    """--station-stage off: the target starts on the scale (at `place`), not at `pick`."""
+    return plan.station is not None and plan.stage == "off"
 
 
 # --fast: the light planner. The same collision sweep, coarser: IK every VALIDATE_STEP along straight legs and
@@ -1364,6 +1378,7 @@ def validate(planner: AzPlanner, ws: Workspace, plan: Plan, q_start: np.ndarray,
     q = np.array(q_start[:6])
     worst, who, legs, low = 1e9, "", [], 1e9
     keep = ws.target
+    placed = placed or starts_placed(plan)
     ws.aim(None if holding else plan.obj, None if holding else (plan.place if placed else plan.pick))
     try:
         return _walk(planner, ws, plan, q, step, wps, holding, carry, worst, who, legs, low)
@@ -1739,12 +1754,13 @@ def _make_plan(objs: list[Obj], index: int, args: "Args", planner: AzPlanner) ->
                     why = reason if m == mode else f"{reason} -- BUT that failed ({tried[-1]}), fell back to '{m}'"
                     plan = Plan(obj, obstacles, m, why, yaw, tilt, az, obj.xy, place, z_grasp, z_travel, open_grip,
                                 station=STATION if POUR is None else None,
-                                weigh=args.weigh if STATION is not None else 0.0, pour=POUR)
+                                weigh=args.weigh if STATION is not None else 0.0, pour=POUR,
+                                stage=args.station_stage if (STATION is not None and POUR is None) else "cycle")
                     pause = args.pause if args.rescan else 0.0
                     for park in ("rest", "ready"):
                         plan.waypoints = build_waypoints(planner, obj, m, yaw, tilt, az, obj.xy, place, z_grasp,
                                                          z_travel, open_grip, args.hold, pause, park,
-                                                         plan.station, plan.weigh, plan.pour)
+                                                         plan.station, plan.weigh, plan.pour, plan.stage)
                         gap, who, legs, low = validate(planner, ws, plan, REST)
                         # something parked against the base only blocks the way home: end upright at READY instead
                         if gap >= 0 or park == "ready" or [l for l, g in legs if g < 0] != ["return to rest"]:
@@ -1817,10 +1833,10 @@ def rebuild(plan: Plan, planner: AzPlanner, pick: tuple[float, float], place: tu
     p = Plan(plan.obj, plan.obstacles, plan.mode, plan.reason, plan.yaw, plan.tilt, plan.az, pick, place,
              plan.z_grasp, plan.z_travel, plan.open_grip, [], plan.clearance, plan.tight_at, plan.legs,
              plan.low_point, plan.margin, plan.servo_ok, plan.servo_note, plan.servo_dist, [], plan.servo_dir,
-             plan.station, plan.weigh, plan.pour)
+             plan.station, plan.weigh, plan.pour, plan.stage)
     p.waypoints = build_waypoints(planner, plan.obj, plan.mode, plan.yaw, plan.tilt, plan.az, pick, place,
                                   plan.z_grasp, plan.z_travel, plan.open_grip, hold, pause,
-                                  station=plan.station, weigh=plan.weigh, pour=plan.pour)
+                                  station=plan.station, weigh=plan.weigh, pour=plan.pour, stage=plan.stage)
     return p
 
 
@@ -2109,8 +2125,8 @@ def view_gate(plan: Plan, planner: AzPlanner, ws: Workspace, q_start: np.ndarray
     walk = plan.waypoints if wps is None else wps
     carry = carried_points(plan.obj, plan.z_grasp, grasp_ahead(planner, plan))
     q = np.array(q_start[:6], dtype=float)
-    holding, placed = False, False
-    stands = tuple(plan.pick)  # where the target stands while it is not in the gripper
+    holding, placed = False, starts_placed(plan)
+    stands = tuple(plan.place if placed else plan.pick)  # where the target stands while it is not in the gripper
     swept, bad = [], []
     why = {"obstacles": 0, "depth height map": 0, "target": 0, "carried object": 0}
     obst = [(np.array(o.xy), o.radius + ws.margin, o.height + 0.01) for o in plan.obstacles if o.poly is None]
@@ -3121,6 +3137,85 @@ def refirm(arm: Arm, q: np.ndarray, target: float, when: str, max_mm: float = 5.
     print(f"   re-firmed {when}: load {l0:.2f} -> {load(arm, 4):.2f}, {(g0 - arm.grip) * JAW_STROKE * 1000:.1f} mm closer")
 
 
+def spout_tip_px(frame: np.ndarray, roi: np.ndarray | None = None) -> tuple[float, float] | None:
+    """Pixel of the wash bottle's spout tip: the orange cap-and-tube blob's point farthest from its thickest part (the
+    cap). Only inside `roi` (a mask) when given, and only strongly saturated orange - skin is orange-ish but paler (a hand
+    near the dish was taken for the spout). None when no orange blob of a plausible size is seen."""
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    m = ((hsv[..., 0] >= 8) & (hsv[..., 0] <= 25) & (hsv[..., 1] > 160) & (hsv[..., 2] > 110)).astype(np.uint8)
+    if roi is not None:
+        m &= roi
+    m = cv2.morphologyEx(m, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    n, lab, st, _ = cv2.connectedComponentsWithStats(m)
+    if n < 2:
+        return None
+    k = 1 + int(np.argmax(st[1:, cv2.CC_STAT_AREA]))
+    if st[k, cv2.CC_STAT_AREA] < 400:
+        return None
+    blob = (lab == k).astype(np.uint8)
+    dt = cv2.distanceTransform(blob, cv2.DIST_L2, 5)
+    cy, cx = np.unravel_index(int(np.argmax(dt)), dt.shape)
+    ys, xs = np.nonzero(blob)
+    j = int(np.argmax((xs - cx) ** 2 + (ys - cy) ** 2))
+    return float(xs[j]), float(ys[j])
+
+
+def aim_spout(arm: Arm, planner: AzPlanner, q: np.ndarray, target: np.ndarray, tip_z: float, tries: int = 2,
+              max_fix: float = 0.06) -> np.ndarray | None:
+    """With the bottle tilted over the dish: find the spout tip in the detection camera, compare it with `target` (xy)
+    at the tip's height, and slide the gripper (orientation kept) to cancel the error. Returns the corrected joints, or
+    None when the tip is not found or the error is too large to trust (then do not squeeze)."""
+    cam = OPEN_CAMS.get(DET)
+    model = FUSED_MODELS.get(DET)
+    if cam is None or model is None:
+        print("   !! spout aim: the detection camera is not open")
+        return None
+    out = CAPTURES / "pour"
+    out.mkdir(parents=True, exist_ok=True)
+    for it in range(tries + 1):
+        time.sleep(0.6)
+        frame = cam.latest()
+        # search only around where the tip should be: 8 cm around the target, from the tip's height down to the rim
+        roi = np.zeros(frame.shape[:2], np.uint8)
+        th = np.linspace(0, 2 * np.pi, 36)
+        for z in (tip_z + 0.06, tip_z, max(0.0, tip_z - 0.06)):
+            ring = np.c_[target[0] + 0.08 * np.cos(th), target[1] + 0.08 * np.sin(th), np.full(36, z)]
+            cv2.fillConvexPoly(roi, cv2.convexHull(model.project(ring).astype(np.int32)), 1)
+        px = spout_tip_px(frame, roi)
+        if px is None:
+            print("   !! spout aim: no spout tip in view")
+            return None
+        tip = model.hit_plane(px[0], px[1], tip_z)[:2]
+        err = tip - np.asarray(target[:2])
+        v = frame.copy()
+        cv2.circle(v, (int(px[0]), int(px[1])), 10, (0, 0, 255), 2)
+        tp = model.project(np.array([[target[0], target[1], tip_z]]))[0]
+        cv2.drawMarker(v, (int(tp[0]), int(tp[1])), (0, 255, 0), cv2.MARKER_CROSS, 24, 2)
+        cv2.imwrite(str(out / f"aim_{time.strftime('%H%M%S')}_{it}.jpg"), v)
+        print(f"   spout aim {it}: tip at ({tip[0]:+.3f}, {tip[1]:+.3f}), {np.linalg.norm(err) * 100:.1f} cm from the target")
+        if np.linalg.norm(err) <= 0.008:
+            return q
+        if np.linalg.norm(err) > max_fix or it == tries:
+            if np.linalg.norm(err) > max_fix:
+                print(f"   !! spout aim: {np.linalg.norm(err) * 100:.1f} cm off - too far to trust, not pouring")
+                return None
+            return q
+        R = site_rot(planner, q)
+        T = np.eye(4)
+        T[:3, :3] = R
+        T[:3, 3] = planner.fk_pos(q) - np.r_[err, 0.0]
+        q0 = np.zeros(planner.model.nq)
+        q0[:6] = q
+        good, qq = planner.kin.ik(T, "grasp_site", init_q=q0, limits=planner.limits, max_iters=400,
+                                  pos_threshold=1e-3, ori_threshold=2e-2)
+        if not good:
+            print("   !! spout aim: no IK for the correction")
+            return q
+        q = np.array(qq[:6])
+        arm.glide_path([q], 1.5)
+    return q
+
+
 def loosen(arm: Arm, q: np.ndarray, amount: float, seconds: float = 2.0) -> None:
     """Open the held jaw by `amount` (grip units) in small, slow steps - never a jump the bottle can fall out of."""
     n = max(1, int(round(amount / 0.0005)))
@@ -3412,9 +3507,16 @@ def _run_legs(plan: Plan, planner: AzPlanner, arm: Arm, cam: LiveCamera | None, 
                         live.set(phase=f"tilting {args.pour_tilt_deg:.0f} deg toward the bowl")
                     arm.glide_path(tilt_path, 4.0)
                     time.sleep(0.5)
-            if args.pour_tilt_deg <= 0 or tilt_path is not None:
+            aimed = True
+            if tilt_path is not None and args.pour_aim:
+                # the spout's measured offset is only approximate: find its tip in the detection camera and slide the
+                # gripper until it is over the target
+                q_aim = aim_spout(arm, planner, tilt_path[-1], np.array(P["tip_at"]), args.pour_lip)
+                aimed = q_aim is not None
+            if aimed and (args.pour_tilt_deg <= 0 or tilt_path is not None):
                 squeeze_pour(arm, plan, args, live)
             if tilt_path is not None:
+                arm.glide_path([tilt_path[-1]], 1.5)  # undo any aiming slide
                 arm.glide_path(list(reversed(tilt_path[:-1])) + [q_level], 3.0)  # back to level
         elif wp.kind == "hold":
             if args.pour_over and holding:
@@ -3647,10 +3749,16 @@ class Args:
     """Height (m) the spout tip is brought down to at full tilt (a few cm above the bowl's rim)."""
     pour_bowl: str | None = None
     """"x,y,radius,rim_z": the bowl, kept clear of the tilting bottle and arm."""
+    pour_aim: bool = True
+    """--pour-oz: once tilted, find the spout tip in the detection camera and slide the gripper over the target first
+    (no squeeze when the tip is not found or is more than 6 cm off)."""
     pour_load_max: float = 0.85
     """--pour-oz: stop squeezing at this gripper-motor load (1.0 ~ the --grip-force cap)."""
     pour_max_squeeze: float = 0.020
     """m the jaw may close past the held grip while squeezing (a crushing / runaway guard)."""
+    station_stage: str = "cycle"
+    """--station: "cycle" (onto the scale, weigh, back), "on" (onto the scale, weigh, leave it there), "off" (the
+    object already stands on the scale at the place point: take it off and set it down at the --given xy)."""
     station_place: str | None = None
     """--station: "x,y" to set the object down at instead of station.json's place point (must be on the platform) -
     e.g. nearer the base for a heavy object carried high with a flat wrist."""
@@ -3868,7 +3976,7 @@ def stage_background(args: Args) -> None:
     """Capture the empty-table reference both this script and scene3d.py subtract. Everything that is on
     the table now becomes invisible to detection, so the table must be clear."""
     CAPTURES.mkdir(exist_ok=True)
-    for key, idx in (("cam0", 0), ("cam1", 1), ("cam2", 2)):  # camN is OpenCV index N
+    for key, idx in (("cam0", 0), ("cam1", 1), ("cam2", 2), ("cam3", 3)):  # camN (YAM_CAM_MAP picks the device)
         try:
             frame = grab(idx)
         except RuntimeError as e:
@@ -3941,7 +4049,7 @@ def stage_run(args: Args) -> None:
             if k not in cams:
                 cams[k] = LiveCamera(int(k[3:]))
         if args.record:  # record every camera, calibrated or not
-            for i in range(3):
+            for i in range(4):
                 if f"cam{i}" not in cams:
                     try:
                         cams[f"cam{i}"] = LiveCamera(i)

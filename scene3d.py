@@ -28,7 +28,7 @@ import tyro
 from calib3d import CameraModel, load_cameras, triangulate
 
 HERE = Path(__file__).resolve().parent
-BACKGROUND = {f"cam{i}": HERE / f"captures/bg_cam{i}.png" for i in range(3)}  # empty table, captured just before the objects were placed
+BACKGROUND = {f"cam{i}": HERE / f"captures/bg_cam{i}.png" for i in range(4)}  # empty table, captured just before the objects were placed
 TABLE_ROI_CAM0 = (200, 0, 1180, 720)  # v0, u0, u1, v1: below the base plate, left of the operator
 
 

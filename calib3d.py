@@ -47,6 +47,10 @@ class Args:
     """Override the grid's x values (m), e.g. "0.18,0.28,0.38" - aim the sweep at the workspace zone."""
     gy: str | None = None
     """Override the grid's y values (m), e.g. "-0.16,-0.05,0.06"."""
+    speed: float = 1.0
+    """--sweep: move this many times faster between points (the pauses for the camera frames stay the same)."""
+    gz: str | None = None
+    """Override the grid's z levels (m), e.g. "0.12,0.18,0.24" - above the weigh station's top (5.2 cm)."""
     dirs: str = "sweep,sweep_low"
     """Sweep folders under captures/: --sweep writes the first, --solve/--check read all of them. After a
     camera moves, sweep into a new folder and solve from it alone (old sweeps saw the old camera pose)."""
@@ -110,7 +114,7 @@ def stage_sweep(args: Args) -> None:
 
     dirs = sweep_dirs(args)
     SWEEP = dirs[0] if args.dirs != Args.dirs else (SWEEPS[0] if args.grid == "full" else SWEEPS[1])
-    GRID_Z = GRIDS_Z[args.grid]
+    GRID_Z = [float(v) for v in args.gz.split(",")] if args.gz else GRIDS_Z[args.grid]
     GX = [float(v) for v in args.gx.split(",")] if args.gx else GRID_X
     GY = [float(v) for v in args.gy.split(",")] if args.gy else GRID_Y
     SWEEP.mkdir(parents=True, exist_ok=True)
@@ -136,17 +140,18 @@ def stage_sweep(args: Args) -> None:
     try:
         arm.set_grip(GRIP_OPEN, 1.0)
         q0, yaw, tilt = planner.ik(pts[0][0], pts[0][1], Z_TRAVEL, arm.q())
-        goto_joint(arm, planner, q0, 4.0)
+        sp = max(0.5, float(args.speed))
+        goto_joint(arm, planner, q0, 4.0 / sp)
         for i, (x, y, z) in enumerate(pts):
             print(f"[{i:2d}/{len(pts)}] ({x:.2f}, {y:.2f}, {z:.2f})", end=" ")
             try:
                 if z >= Z_TRAVEL:  # travel move: straight up, over, and skip the blink
                     here = planner.fk_pos(arm.q())
-                    move_cartesian(arm, planner, here[0], here[1], Z_TRAVEL, yaw, tilt, 2.0)
-                    move_cartesian(arm, planner, x, y, Z_TRAVEL, yaw, tilt, 3.0)
+                    move_cartesian(arm, planner, here[0], here[1], Z_TRAVEL, yaw, tilt, 2.0 / sp)
+                    move_cartesian(arm, planner, x, y, Z_TRAVEL, yaw, tilt, 3.0 / sp)
                     print("travel")
                     continue
-                move_cartesian(arm, planner, x, y, z, yaw, tilt, 2.5)
+                move_cartesian(arm, planner, x, y, z, yaw, tilt, 2.5 / sp)
                 p = settle(arm, planner, x, y, z, yaw, tilt)
             except RuntimeError as e:
                 print("skip:", e)
