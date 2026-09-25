@@ -16,8 +16,28 @@ D_DEFAULT = 0.0785
 
 
 def find(frame: np.ndarray, cam, guess, diameter: float = D_DEFAULT, quiet: bool = False):
-    """The bottle axis (x, y) near `guess`, or None when fewer than 12 tape-bordered edge points or a poor fit."""
+    """The bottle axis (x, y) near `guess`. The rows the edges are read from follow the guess, so a guess a few cm
+    off reads the wrong part of the body: a small grid of starts around it is tried, the best fit kept."""
     guess = np.asarray(guess, dtype=float)[:2]
+    best = None
+    for dx in (0.0, 0.02, -0.02, 0.04, -0.04):
+        for dy in (0.0, 0.015, -0.015, 0.03, -0.03):
+            r = _fit(frame, cam, guess + (dx, dy), diameter)
+            if r is not None and (best is None or r[1] < best[1]):
+                best = r
+        if best is not None and best[1] < 0.002:
+            break
+    if best is None or np.linalg.norm(np.array(best[0]) - guess) > 0.06:
+        if not quiet:
+            print("no consistent body fit near the guess", file=sys.stderr)
+        return None
+    if not quiet:
+        print(f"body fit: rms {best[1] * 1000:.1f} mm", file=sys.stderr)
+    return best[0]
+
+
+def _fit(frame: np.ndarray, cam, guess, diameter: float):
+    """One fit from one start: ((x, y), rms) or None."""
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     blue = (hsv[..., 0] > 95) & (hsv[..., 0] < 125) & (hsv[..., 1] > 90)
     pale = (hsv[..., 1] < 70) & (hsv[..., 2] > 110)
@@ -39,33 +59,42 @@ def find(frame: np.ndarray, cam, guess, diameter: float = D_DEFAULT, quiet: bool
             a -= 1
         while b < W - 1 and not blue[v, b + 1]:
             b += 1
-        # keep an edge only if blue tape lies just outside it and the run is not absurdly wide
+        # keep an edge only if blue tape lies just outside it (the desk reads as pale as the bottle in some light,
+        # and the white sheet always does) and the run is not absurdly wide
         for u, out in ((a, a - 4), (b, b + 4)):
             if 0 <= out < W and blue[v, out] and (b - a) < 400:
                 pts.append((u, v))
+    # the front of the base rim: the lowest bottle pixel under the axis, against the tape it stands on. Its ray
+    # meets the table one radius in front of the axis - this pins the depth when only one side has tape edges
+    base = None
+    col = int(ub)
+    if 0 <= col < W:
+        v = int(vb) - 25
+        while v < frame.shape[0] - 1 and not blue[v + 1, col]:
+            v += 1
+        if v < frame.shape[0] - 1 and v > int(vb) - 25:
+            P = cam.hit_plane(float(col), float(v), 0.0)[:2]
+            d = P - np.asarray(cam.C[:2], dtype=float)
+            base = P + (diameter / 2) * d / (np.linalg.norm(d) + 1e-9)
     if len(pts) < 12:
-        if not quiet:
-            print(f"only {len(pts)} tape-bordered edge points", file=sys.stderr)
         return None
     rays = [cam.ray(float(u), float(v)) for u, v in pts]
 
     def resid(p):
         out = []
         for o, dv in rays:
-            zs = np.linspace(0, 0.10, 21)
+            zs = np.linspace(0, 0.13, 27)  # the straight body, base to shoulder
             P = o[None] + ((zs - o[2]) / dv[2])[:, None] * dv[None]
             out.append(np.min(np.hypot(P[:, 0] - p[0], P[:, 1] - p[1])) - diameter / 2)
+        if base is not None:  # worth ~5 edge points
+            out += list(np.sqrt(5.0) * (np.asarray(p) - base))
         return np.array(out)
 
     s = least_squares(resid, guess, loss="soft_l1", f_scale=0.002)
     rms = float(np.sqrt(np.mean(s.fun ** 2)))
     if rms > 0.004:
-        if not quiet:
-            print(f"bad fit: rms {rms * 1000:.1f} mm", file=sys.stderr)
         return None
-    if not quiet:
-        print(f"body fit: {len(pts)} tape-bordered edge points, rms {rms * 1000:.1f} mm", file=sys.stderr)
-    return float(s.x[0]), float(s.x[1])
+    return (float(s.x[0]), float(s.x[1])), rms
 
 
 if __name__ == "__main__":

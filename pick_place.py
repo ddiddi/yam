@@ -903,14 +903,14 @@ class Workspace:
         rr = obj.radius_at(P[sel, 2] - base)  # a neck lets the arm closer up there
         return float((np.linalg.norm(P[sel, :2] - np.asarray(xy), axis=1) - rr).min()) - tol
 
-    def scan(self, q_from: np.ndarray, q_to: np.ndarray, carry=None, n: int = 12) -> tuple[float, str, float]:
+    def scan(self, q_from: np.ndarray, q_to: np.ndarray, carry=None, n: int | None = None) -> tuple[float, str, float]:
         """Sweep the straight joint-space path the arm will actually glide through: worst clearance from
         the objects, what it was against, and the lowest point any mesh reaches (the table check).
 
         `Planner.path_is_safe` tests geom origins against a fixed 2 cm floor, which vetoes a legitimate
         low grasp on a flat object; the real fingertip surface is a mesh vertex, so it is measured here."""
         worst, who, zmin = 1e9, "", 1e9
-        for a in np.linspace(0.0, 1.0, n):
+        for a in np.linspace(0.0, 1.0, n or SCAN_N):
             q = (1 - a) * q_from + a * q_to
             pts = self.points(q)
             zmin = min(zmin, float(pts[:, 2].min()))  # arm only: the carried object legitimately
@@ -1017,13 +1017,21 @@ def follow(arm: Arm, planner: AzPlanner, ws: "Workspace", qs: list, seconds: flo
     is deliberately off (it compensates sag) and the model puts it lower than the arm really is."""
     q = arm.q()
     ws.jaw_half = float(np.clip(arm.grip, 0.0, 1.0)) * JAW_STROKE / 2  # checked at the jaw's actual opening
-    for q_next in qs:  # the whole leg is re-checked first, then travelled as one smooth motion
-        gap, who, zmin = ws.scan(q, np.asarray(q_next, dtype=float), carry)
+    # a palm grasp leaves the arm touching what it just let go of: the first segment then starts "inside" it.
+    # Leaving contact is allowed - never deeper than where it starts, and ending clearer than it began
+    g_start = ws.scan(q, q, carry, n=1)[0]
+    for k, q_next in enumerate(qs):  # the whole leg is re-checked first, then travelled as one smooth motion
+        q_next = np.asarray(q_next, dtype=float)
+        gap, who, zmin = ws.scan(q, q_next, carry)
         if floor_z is not None and zmin < floor_z:
             raise RuntimeError(f"a planned segment would reach {zmin * 100:.1f} cm: too low")
         if gap < 0:
-            raise RuntimeError(f"a planned segment would enter {who}")
-        q = np.asarray(q_next, dtype=float)
+            leaving = (k == 0 and g_start < 0 and gap >= g_start - 0.001
+                       and ws.scan(q_next, q_next, carry, n=1)[0] > g_start)
+            if not leaving:
+                raise RuntimeError(f"a planned segment would enter {who}")
+            print(f"   (leaving contact with {who}: {g_start * 100:+.1f} -> clearer)")
+        q = q_next
     arm.glide_path([np.asarray(v, dtype=float) for v in qs], seconds)
 
 
@@ -1312,13 +1320,21 @@ def build_waypoints(planner: AzPlanner, obj: Obj, mode: str, yaw: float, tilt: f
     return wps
 
 
-def validate(planner: AzPlanner, ws: Workspace, plan: Plan, q_start: np.ndarray, step: float = 0.02,
+# --fast: the light planner. The same collision sweep, coarser: IK every VALIDATE_STEP along straight legs and
+# SCAN_N poses per joint segment; no 1 cm robustness re-plans, no fused-view check, no depth, no rescans.
+FAST = False
+VALIDATE_STEP = 0.02  # m between IK solves along a straight leg (--fast: 0.05)
+SCAN_N = 12  # poses swept per joint-space segment (--fast: 4)
+
+
+def validate(planner: AzPlanner, ws: Workspace, plan: Plan, q_start: np.ndarray, step: float | None = None,
              wps: list[WP] | None = None, holding: bool = False,
              placed: bool = False) -> tuple[float, str, list[tuple[str, float]], float]:
     """Walk the waypoints exactly as `execute` will - IK on every 2 cm sub-step, then sweep each joint
     segment against the no-go cylinders. Returns the worst clearance, what it was against, the clearance
     of every leg, and the lowest point any part of the arm reaches."""
     planner.az = plan.az
+    step = VALIDATE_STEP if step is None else step
     carry = carried_points(plan.obj, plan.z_grasp, grasp_ahead(planner, plan))
     q = np.array(q_start[:6])
     worst, who, legs, low = 1e9, "", [], 1e9
@@ -1715,7 +1731,7 @@ def _make_plan(objs: list[Obj], index: int, args: "Args", planner: AzPlanner) ->
                     plan.margin = args.margin
                     if args.servo:
                         check_servo_point(planner, ws, plan)
-                    weak = fragile(plan, planner, ws, args)
+                    weak = "" if FAST else fragile(plan, planner, ws, args)
                     if not weak:
                         return plan
                     fallback = fallback or (plan, weak)
@@ -2849,7 +2865,7 @@ def execute(plan: Plan, planner: AzPlanner, arm: Arm, cam: LiveCamera | None, cm
               "not moving")
         return False
     frames = {k: c.latest() for k, c in FUSED_CAMS.items()} if FUSED_CAMS else None
-    if not view_gate(plan, planner, ws, arm.q(), frames, "planned trajectory"):
+    if not FAST and not view_gate(plan, planner, ws, arm.q(), frames, "planned trajectory"):
         print("!! the fused-view check found the arm inside a clearance: not moving")
         return False
     if args.servo and not plan.servo_ok and not args.open_loop:
@@ -2889,7 +2905,7 @@ def execute(plan: Plan, planner: AzPlanner, arm: Arm, cam: LiveCamera | None, cm
         show_plan(live, planner, plan)
         print(f"   corrected plan: clearance {fmt_gap(gap)}" + (f" from {who}" if who else ""))
         frames = {k: c.latest() for k, c in FUSED_CAMS.items()} if FUSED_CAMS else None
-        if not view_gate(plan, planner, ws, arm.q(), frames, "corrected trajectory", plan.lead + plan.waypoints[2:]):
+        if not FAST and not view_gate(plan, planner, ws, arm.q(), frames, "corrected trajectory", plan.lead + plan.waypoints[2:]):
             bail(arm, planner, ws, plan, False, "the corrected trajectory fails the fused-view check")
             return False
         plan.legs = legs
@@ -3290,6 +3306,9 @@ class Args:
     was corrected by)."""
     refind_max: float = 0.05
     """--refind: the object moved more than this since the grasp was aimed: stop instead of chasing it."""
+    fast: bool = False
+    """The light planner: same collision sweep but coarser (5 cm IK steps, 4 poses per segment), and no robustness
+    re-plans, fused-view check, depth analysis or mid-run rescans. Plans in seconds; use with --given objects."""
     palm: bool = False
     """Seat the object against the palm: full depth only, and the gripper housing may come to 4 mm of the target
     (it is meant to touch it). For big objects (a wash bottle's body) where the whole jaw must be engaged."""
@@ -3719,8 +3738,12 @@ def stage_run(args: Args) -> None:
 
 def main(args: Args) -> None:
     global JAW_ACROSS, MAX_OBJ_WIDTH, SIDE_TILTS, TABLE_SLACK, CAM_MOVED_PX, TIP_PROBE, STATION
-    global TARGET_TOL, TALL_TOL, SEAT_BACKOFFS
+    global TARGET_TOL, TALL_TOL, SEAT_BACKOFFS, FAST, VALIDATE_STEP, SCAN_N
     TIP_PROBE = float(args.tip_probe)
+    if args.fast:
+        FAST, VALIDATE_STEP, SCAN_N = True, 0.05, 4
+        args.depth, args.rescan = False, False
+        print("fast planner: coarse sweep, no robustness re-plans / fused-view check / depth / rescans")
     if args.palm:  # the palm is meant to touch the object: seat it fully, no shallower fallbacks
         TARGET_TOL = TALL_TOL = 0.004
         SEAT_BACKOFFS = (0.0,)

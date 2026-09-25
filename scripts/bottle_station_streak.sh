@@ -7,10 +7,10 @@
 # (bottle untouched) are retried. Weigh photos -> captures/weigh_bottle_run<k>_cam*_*.jpg, tares -> captures/weigh_bottle_tare<k>.jpg
 cd "$(dirname "$0")/.."
 export YAM_CAM_MAP="1:2,2:1"
-N=${1:-5}; xy=${2:-0.2693,0.0738}
+N=${1:-5}; xy=${2:-0.2693,0.0738}; ok=${3:-0}  # 3rd arg: successes already in the streak
 OFF_X=0.009  # the arm's offset from the camera fit (same as the successful run)
 rm -f captures/live/STOP
-ok=0; k=0; retries=0
+k=0; retries=0
 while [ $ok -lt $N ]; do
   k=$((k + 1))
   [ -f captures/live/STOP ] && { echo "stopping: STOP file"; break; }
@@ -23,15 +23,21 @@ while [ $ok -lt $N ]; do
   L=captures/live/station_bottle_streak_$k.log
   YAM_BATCH="wash bottle weigh $((ok + 1))/$N" .venv/bin/python -u pick_place.py --run --station --palm --weigh 8 --object 0 \
     --grasp side --side-only --side-tilt 75 --side-cross-max 1.0 --z-grasp 0.08 --soft --grip-load 0.45 --grip-load-max 0.65 \
-    --grip-force 50 --skin-max 5000 --no-servo --tactile --refind scripts/bottle_find.py --refind-offset $OFF_X,0 \
+    --grip-force 50 --skin-max 5000 --no-servo --fast --cam-moved-px 6 --tactile --refind scripts/bottle_find.py --refind-offset $OFF_X,0 \
     --given-only --given "$aim,0.0785,0.22" --record datasets/yam_weigh_station \
     --task "pick up the water-filled wash bottle at full depth, set it on the scale, then put it back where it was" > $L 2>&1
   st=$(python3 -c "import json;print(json.load(open('captures/live/state.json'))['status'])")
   for f in captures/weigh_cam*_*.jpg(N); do mv $f captures/weigh_bottle_run${k}_${f:t:r:s/weigh_//}.jpg; done
   grips=$(grep -c "OK.*lifting" $L)
   grep -E "soft contact|grip check|hold test|still holding|scale display|re-measured|!!" $L | grep -v "has moved\|tactile skin not" | tail -8
-  after=$(.venv/bin/python scripts/bottle_find.py "$xy" 2>/dev/null | cut -d, -f1,2)
-  d=$([ -n "$after" ] && python3 -c "import math;a=[float(v) for v in '$xy'.split(',')];b=[float(v) for v in '$after'.split(',')];print(f'{math.dist(a,b)*100:.1f}')" || echo "-")
+  after=""
+  for try in 1 2 3; do  # the arm may still be folding away through the view: wait, look again
+    sleep 2
+    after=$(.venv/bin/python scripts/bottle_find.py "$xy" 2>/dev/null | cut -d, -f1,2)
+    [ -n "$after" ] && break
+  done
+  d="-"
+  [ -n "$after" ] && d=$(python3 -c "import math;a=[float(v) for v in '$xy'.split(',')];b=[float(v) for v in '$after'.split(',')];print(f'{math.dist(a,b)*100:.1f}')")
   echo "run $k: status $st, grips passed $grips (2 needed), bottle back at ($after), $d cm from the pick point"
   if [ "$st" = "done" ] && [ "$grips" -ge 2 ] && [ "$d" != "-" ] && python3 -c "import sys;sys.exit(0 if $d <= 2.0 else 1)"; then
     ok=$((ok + 1)); echo "run $k: SUCCESS ($ok in a row)"; xy=$after
