@@ -155,6 +155,7 @@ def zone_margin(xy, zone: np.ndarray) -> float:
 
 # ---- the weigh station (station.json, from calib_tools/station_calib.py + the measured footprint) -------
 STATION_FILE = HERE / "station.json"
+POUR: dict | None = None  # set by --pour-oz: {"oz", "base_z", "tip", "tip_at", "axis"}
 STATION: dict | None = None  # set by --station: {"top_z", "footprint" [[x, y] x4], "place" [x, y], ...}
 STATION_MARGIN = 0.012  # m: the station is a measured box, not a detection - a tighter margin than MARGIN
 SURFACE_SLACK = 0.003  # m: how far below the station top a point may be over it (the carried object sits ON it)
@@ -1201,6 +1202,7 @@ class Plan:
     servo_dir: tuple | None = None  # unit xy direction from the pick point to the check point
     station: dict | None = None  # --station: the place point is the scale top; the object then goes back to `pick`
     weigh: float = 0.0  # --station: seconds the object sits on the scale, the gripper clear of it
+    pour: dict | None = None  # --pour-oz: {"oz", "base_z", "tip"}; the place point is where the bottle axis pours from
 
     def to_json(self) -> dict:
         return {
@@ -1224,7 +1226,7 @@ class Plan:
 def build_waypoints(planner: AzPlanner, obj: Obj, mode: str, yaw: float, tilt: float, az: float | None,
                     pick: tuple[float, float], place: tuple[float, float], z_grasp: float, z_travel: float,
                     open_grip: float, hold: float, pause: float = 0.0, park: str = "rest",
-                    station: dict | None = None, weigh: float = 0.0) -> list[WP]:
+                    station: dict | None = None, weigh: float = 0.0, pour: dict | None = None) -> list[WP]:
     """With `station`: the place point is on the scale top (every place height rises by its top_z); after the
     release the gripper backs off and waits `weigh` s, takes the object again exactly as it let go of it, and
     sets it down back where it was picked (`at` on each release says where the object then stands)."""
@@ -1260,6 +1262,29 @@ def build_waypoints(planner: AzPlanner, obj: Obj, mode: str, yaw: float, tilt: f
         pre = tuple(np.array([x, y, z_grasp]) - back * zg)
         pre_place = tuple(np.array([px, py, zp]) - back * zg)
         on = "onto the scale" if station else "the place point"
+        if pour:  # hold it over the bowl (the place point is where its axis goes), squeeze, bring it back
+            zp = z_grasp + float(pour["base_z"])  # the bottle's base hangs this high while it pours
+            wps += [
+                WP("pre-grasp beside the object", pre, 3.0, settle=True),
+                WP("slide the fingers around it", (x, y, z_grasp), 3.0, settle=True),
+                WP("close on the object", (x, y, z_grasp), 0.0, kind="close"),
+                WP("lift", (x, y, z_travel), 3.0),
+                WP(f"hold {hold:.0f} s", (x, y, z_travel), hold, kind="hold"),
+            ] + look2 + [
+                WP("carry over the bowl", (px, py, z_travel), 3.5),
+                WP("lower to the pour height", (px, py, zp), 3.0, settle=True),
+                WP(f"squeeze-pour {pour['oz']:.1f} oz", (px, py, zp), 0.0, kind="squeeze"),
+                WP("lift from the bowl", (px, py, z_travel), 3.0),
+                WP("carry back to where it was", (x, y, z_travel), 3.5),
+                WP("lower back down", (x, y, z_grasp), 3.0, settle=True),
+                WP("release it back", (x, y, z_grasp), 1.5, grip=GRIP_OPEN, at=tuple(pick)),
+                WP("back the fingers out again", pre, 2.5),
+                WP("clear of the table", (x, y, z_travel), 2.5),
+            ]
+            wps.append(WP("fold back to ready", ready, 3.5, kind="pose", q=np.array(READY)))
+            if park == "rest":
+                wps.append(WP("return to rest", (0.0, 0.0, 0.0), 3.0, kind="rest"))
+            return wps
         wps += [
             WP("pre-grasp beside the object", pre, 3.0, settle=True),
             WP("slide the fingers around it", (x, y, z_grasp), 3.0, settle=True),
@@ -1355,7 +1380,7 @@ def _walk(planner, ws, plan, q, step, wps, holding, carry, worst, who, legs, low
             holding = True
             ws.aim(None)
             continue
-        if wp.kind in ("hold", "rescan"):
+        if wp.kind in ("hold", "rescan", "squeeze"):
             continue
         c = carry if holding else None
         if wp.kind in ("rest", "pose"):
@@ -1687,7 +1712,9 @@ def _make_plan(objs: list[Obj], index: int, args: "Args", planner: AzPlanner) ->
             for yaw, tilt, az in cands:
                 try:
                     place_dir = args.place_dir
-                    if STATION is not None:
+                    if POUR is not None:
+                        place = tuple(float(v) for v in POUR["axis"])
+                    elif STATION is not None:
                         place = tuple(float(v) for v in STATION["place"])
                     elif args.shuttle and place_dir is None:  # repeated runs go back and forth between two spots
                         zone = load_zone()
@@ -1697,7 +1724,7 @@ def _make_plan(objs: list[Obj], index: int, args: "Args", planner: AzPlanner) ->
                             place_dir = ang if np.linalg.norm(to_mid) > args.place_dist / 2 else ang + 180.0
                         else:
                             place_dir = 0.0 if obj.reach < SHUTTLE_R else 180.0
-                    if STATION is None:
+                    if STATION is None and POUR is None:
                         try:
                             place = choose_place(planner, ws, obj, obj.xy, yaw, tilt, az, z_grasp, z_travel,
                                                  args.place_dist, place_dir)
@@ -1711,12 +1738,13 @@ def _make_plan(objs: list[Obj], index: int, args: "Args", planner: AzPlanner) ->
                     open_grip = float(min(GRIP_OPEN, (obj.grip_width + 2 * gap_side) / JAW_STROKE))
                     why = reason if m == mode else f"{reason} -- BUT that failed ({tried[-1]}), fell back to '{m}'"
                     plan = Plan(obj, obstacles, m, why, yaw, tilt, az, obj.xy, place, z_grasp, z_travel, open_grip,
-                                station=STATION, weigh=args.weigh if STATION is not None else 0.0)
+                                station=STATION if POUR is None else None,
+                                weigh=args.weigh if STATION is not None else 0.0, pour=POUR)
                     pause = args.pause if args.rescan else 0.0
                     for park in ("rest", "ready"):
                         plan.waypoints = build_waypoints(planner, obj, m, yaw, tilt, az, obj.xy, place, z_grasp,
                                                          z_travel, open_grip, args.hold, pause, park,
-                                                         plan.station, plan.weigh)
+                                                         plan.station, plan.weigh, plan.pour)
                         gap, who, legs, low = validate(planner, ws, plan, REST)
                         # something parked against the base only blocks the way home: end upright at READY instead
                         if gap >= 0 or park == "ready" or [l for l, g in legs if g < 0] != ["return to rest"]:
@@ -1727,6 +1755,19 @@ def _make_plan(objs: list[Obj], index: int, args: "Args", planner: AzPlanner) ->
                         raise RuntimeError(f"'{leg}' passes {abs(gap) * 100:.1f} cm inside {who}'s no-go zone"
                                            + (f" (the arm already stands that close to {who} at rest; move it)"
                                               if leg == "unfold to ready" else ""))
+                    if POUR is not None and args.pour_tilt_deg > 0:
+                        # the tilt toward the bowl is planned at run time from the arm's pose; check now that it exists
+                        lw = next(w for w in plan.waypoints if w.label == "lower to the pour height")
+                        base = np.array([place[0], place[1], float(POUR["base_z"])])
+                        tip = base + np.array(POUR["tip"])
+                        lip = np.array([POUR["tip_at"][0], POUR["tip_at"][1], args.pour_lip])
+                        bowl = tuple(float(v) for v in args.pour_bowl.split(",")) if args.pour_bowl else None
+                        q_lv = lw.qs[-1] if lw.qs else planner.ik(*lw.xyz, np.array(READY), yaw, tilt)[0]
+                        if bottle_tilt_path(planner, ws, np.asarray(q_lv)[:6], base, tip, lip,
+                                            np.radians(args.pour_tilt_deg), bowl) is None:
+                            raise RuntimeError(f"no safe {args.pour_tilt_deg:.0f} deg tilt toward the bowl")
+                        print(f"  tilt toward the bowl: {args.pour_tilt_deg:.0f} deg, spout tip down to "
+                              f"{args.pour_lip * 100:.0f} cm - reachable and clear")
                     plan.clearance, plan.tight_at, plan.legs, plan.low_point = gap, who, legs, low
                     plan.margin = args.margin
                     if args.servo:
@@ -1757,7 +1798,7 @@ def fragile(plan: "Plan", planner: AzPlanner, ws: "Workspace", args: "Args") -> 
     pause = args.pause if args.rescan else 0.0
     for dx, dy in ((ROBUST_SHIFT, 0), (-ROBUST_SHIFT, 0), (0, ROBUST_SHIFT), (0, -ROBUST_SHIFT)):
         s = np.array([dx, dy])
-        place = plan.place if plan.station is not None else tuple(np.array(plan.place) + s)  # the scale stays put
+        place = plan.place if (plan.station is not None or plan.pour is not None) else tuple(np.array(plan.place) + s)
         alt = rebuild(plan, planner, tuple(np.array(plan.pick) + s), place, args.hold, pause)
         try:
             gap, who, _, _ = validate(planner, ws, alt, REST)
@@ -1776,17 +1817,17 @@ def rebuild(plan: Plan, planner: AzPlanner, pick: tuple[float, float], place: tu
     p = Plan(plan.obj, plan.obstacles, plan.mode, plan.reason, plan.yaw, plan.tilt, plan.az, pick, place,
              plan.z_grasp, plan.z_travel, plan.open_grip, [], plan.clearance, plan.tight_at, plan.legs,
              plan.low_point, plan.margin, plan.servo_ok, plan.servo_note, plan.servo_dist, [], plan.servo_dir,
-             plan.station, plan.weigh)
+             plan.station, plan.weigh, plan.pour)
     p.waypoints = build_waypoints(planner, plan.obj, plan.mode, plan.yaw, plan.tilt, plan.az, pick, place,
                                   plan.z_grasp, plan.z_travel, plan.open_grip, hold, pause,
-                                  station=plan.station, weigh=plan.weigh)
+                                  station=plan.station, weigh=plan.weigh, pour=plan.pour)
     return p
 
 
 def replan(plan: Plan, planner: AzPlanner, pick: tuple[float, float], hold: float, pause: float) -> Plan:
     """Shift the plan onto a corrected pick point (after the visual check); the place point rides along
     on the same offset, which was already validated against the obstacles."""
-    if plan.station is not None:  # the scale does not move with the pick; the way back ends at the corrected pick
+    if plan.station is not None or plan.pour is not None:  # the scale / the bowl does not move with the pick
         return rebuild(plan, planner, pick, plan.place, hold, pause)
     off = np.array(plan.place) - np.array(plan.pick)
     return rebuild(plan, planner, pick, tuple(float(v) for v in np.array(pick) + off), hold, pause)
@@ -1833,11 +1874,11 @@ def fit_corrected(plan: Plan, planner: AzPlanner, ws: Workspace, cmd: tuple[floa
 
 def _fit_with(plan: Plan, planner: AzPlanner, ws: Workspace, cmd, off, args: "Args", pause: float,
               q: np.ndarray, yaw: float, tilt: float, az: float | None) -> tuple[Plan, float, str, list]:
-    place = plan.place if plan.station is not None else tuple(float(v) for v in np.array(cmd) + off)
+    place = plan.place if (plan.station is not None or plan.pour is not None) else tuple(float(v) for v in np.array(cmd) + off)
     base = Plan(plan.obj, plan.obstacles, plan.mode, plan.reason, yaw, tilt, az, cmd,
                 place, plan.z_grasp, plan.z_travel, plan.open_grip,
                 [], plan.clearance, plan.tight_at, plan.legs, plan.low_point, plan.margin, plan.servo_ok,
-                plan.servo_note, plan.servo_dist, [], plan.servo_dir, plan.station, plan.weigh)
+                plan.servo_note, plan.servo_dist, [], plan.servo_dir, plan.station, plan.weigh, plan.pour)
     p = rebuild(base, planner, base.pick, base.place, args.hold, pause)
     gap, who, legs, _ = validate_from_check(planner, ws, p, q)
     if gap < 0:
@@ -1863,7 +1904,7 @@ def print_plan(plan: Plan) -> None:
     print(f"  travel height {plan.z_travel * 100:.0f} cm, wrist yaw {np.degrees(plan.yaw):.0f} deg, tilt "
           f"{np.degrees(plan.tilt):.0f} deg, approach azimuth "
           f"{'radial' if plan.az is None else f'{np.degrees(plan.az):.0f} deg'}")
-    moves = [w for w in plan.waypoints if w.kind not in ("hold", "close", "rescan")]
+    moves = [w for w in plan.waypoints if w.kind not in ("hold", "close", "rescan", "squeeze")]
     for (label, gap), wp in zip(plan.legs, moves):
         print(f"  {label:<28} -> ({wp.xyz[0]:+.3f}, {wp.xyz[1]:+.3f}, {wp.xyz[2]:.3f})   clearance {fmt_gap(gap)}")
     print(f"  tightest point: {fmt_gap(plan.clearance)}"
@@ -2994,6 +3035,265 @@ def reaim_target(plan: Plan, planner: AzPlanner, arm: Arm, ws: "Workspace", args
     return alt
 
 
+def bottle_tilt_path(planner: AzPlanner, ws: "Workspace", q_level: np.ndarray, axis_base: np.ndarray,
+                     tip: np.ndarray, lip: np.ndarray, tilt: float, bowl: tuple | None, n: int = 12) -> list | None:
+    """Joint path that tilts the held squeeze bottle toward the bowl: about the horizontal axis square to its spout
+    (so the spout tips DOWN), while its tip moves from where it is (`tip`, the bottle level) to `lip` - over the
+    bowl, just above the rim. The arm and the bottle's body (a 7.85 cm cylinder from `axis_base` up 18 cm) are
+    checked at every step against the table, the bowl (x, y, radius, rim z) and the weigh station. None if no IK."""
+    R0 = site_rot(planner, q_level)
+    site0 = planner.fk_pos(q_level)
+    v_tip = R0.T @ (tip - site0)
+    # the bottle body as points in the gripper frame (it does not move in the jaw)
+    th = np.linspace(0, 2 * np.pi, 10, endpoint=False)
+    body = np.array([[axis_base[0] + 0.039 * np.cos(a), axis_base[1] + 0.039 * np.sin(a), axis_base[2] + h]
+                     for h in np.linspace(0.0, 0.18, 5) for a in th])
+    body_loc = (body - site0) @ R0  # rows: R0.T @ (p - site0)
+    d = np.r_[tip[:2] - axis_base[:2], 0.0]
+    d /= np.linalg.norm(d) + 1e-9
+    ax = np.cross([0.0, 0.0, 1.0], d)  # horizontal, square to the spout
+    sgn = 1.0 if (_axis_rot(ax, 0.3) @ (tip - axis_base))[2] < (tip - axis_base)[2] else -1.0
+    st = station_obj()
+    path, q = [], np.array(q_level[:6], dtype=float)
+    for k in range(0, n + 1):  # k = 0: the level pose it starts from is checked too
+        f = k / n
+        R = _axis_rot(ax, sgn * tilt * f) @ R0
+        T = np.eye(4)
+        T[:3, :3] = R
+        T[:3, 3] = (tip + (lip - tip) * f) - R @ v_tip
+        q0 = np.zeros(planner.model.nq)
+        q0[:6] = q
+        good, qq = planner.kin.ik(T, "grasp_site", init_q=q0, limits=planner.limits, max_iters=400,
+                                  pos_threshold=2e-3, ori_threshold=3e-2)
+        if not good:
+            print(f"   (bottle tilt: no IK at {np.degrees(tilt * f):.0f} deg)")
+            return None
+        qq = np.array(qq[:6])
+        if np.max(np.abs(qq - q)) > 0.6:
+            print("   (bottle tilt: IK jumped branch)")
+            return None
+        arm_pts = ws.points(qq)
+        bot = T[:3, 3] + body_loc @ R.T
+        allp = np.vstack([arm_pts, bot])
+        if allp[:, 2].min() < 0.015:
+            print(f"   (bottle tilt: {'the bottle' if bot[:, 2].min() < 0.015 else 'the arm'} would reach the table)")
+            return None
+        if bowl is not None:
+            bx, by, br, bz = bowl
+            inside = np.linalg.norm(allp[:, :2] - [bx, by], axis=1) < br + 0.01
+            if inside.any() and allp[inside, 2].min() < bz + 0.01:
+                print(f"   (bottle tilt: would dip into the bowl's rim at {np.degrees(tilt * f):.0f} deg)")
+                return None
+        if st is not None and box_hits(allp, st, 0.005).any():
+            print(f"   (bottle tilt: would touch the scale at {np.degrees(tilt * f):.0f} deg)")
+            return None
+        if k:
+            path.append(qq)
+        q = qq
+    return path
+
+
+POUR_MAX_LEAD = 0.015  # grip units (1.4 mm): the command may run at most this far ahead of the jaw
+POUR_LOOSEN = 0.004  # grip units (0.4 mm): how far the jaw eases off after the pour, slowly, for the carry home
+POUR_STEP_DRY = 0.0020  # grip units (x 9.5 cm) closed per step before anything flows (~0.19 mm)
+POUR_STEP_FLOW = 0.0008  # ... once it flows (~0.08 mm): the flow follows the squeeze
+POUR_DT = 0.25  # s between squeeze steps
+POUR_LAG = 1.2  # s the display lags the water landing, plus the stream still in the air when the squeeze stops
+POUR_RELAX = 0.004  # grip units opened to stop the flow (the bottle re-expands and sucks the spout back)
+POUR_SETTLE = 3.0  # s to wait before trusting the reading after a stop
+POUR_TOL = 0.1  # oz: done within this of the target (the display's resolution)
+
+
+def refirm(arm: Arm, q: np.ndarray, target: float, when: str, max_mm: float = 5.0) -> None:
+    """Close the held jaw in 0.2 mm steps until the gripper motor's load is back at `target` (at most max_mm)."""
+    from pick_bottle import load
+
+    g0, l0 = arm.grip, load(arm, 4)
+    while load(arm, 4) < target and (g0 - arm.grip) * JAW_STROKE < max_mm / 1000:
+        arm.grip -= 0.002
+        arm._cmd(q)
+        time.sleep(0.08)
+    print(f"   re-firmed {when}: load {l0:.2f} -> {load(arm, 4):.2f}, {(g0 - arm.grip) * JAW_STROKE * 1000:.1f} mm closer")
+
+
+def loosen(arm: Arm, q: np.ndarray, amount: float, seconds: float = 2.0) -> None:
+    """Open the held jaw by `amount` (grip units) in small, slow steps - never a jump the bottle can fall out of."""
+    n = max(1, int(round(amount / 0.0005)))
+    for _ in range(n):
+        arm.grip += amount / n
+        arm._cmd(q)
+        time.sleep(seconds / n)
+
+
+def squeeze_pour(arm: Arm, plan: Plan, args: "Args", live: LiveState | None = None) -> float | None:
+    """Pour plan.pour["oz"] ounces out of the held squeeze bottle into the bowl on the scale, closed on the scale's
+    display (cam2, scale_read.py) with the tactile skin and the gripper motor logged alongside.
+
+    The jaw closes past the held grip in small steps (the pads' skin first, then the bottle's wall); once the
+    reading rises, in finer steps. It stops POUR_LAG x the measured flow rate short of the target - what is still
+    in the air and what the display has not shown yet - relaxes the squeeze (the bottle re-expands and pulls the
+    spout back, so it does not drip), waits for the reading to settle, and tops up in short pulses if it is short.
+    Returns the settled reading (oz), or None when the display could not be read."""
+    import scale_read
+    from pick_bottle import load
+
+    target = float(plan.pour["oz"])
+    cam = OPEN_CAMS.get("cam2") or FUSED_CAMS.get("cam2")
+    if cam is None:
+        print("   !! no cam2 open: cannot read the scale - not pouring")
+        return None
+    t0 = time.time()
+    rows: list[list] = []
+    q0 = np.array(arm.last_cmd[:6], dtype=float)
+
+    def reading() -> float | None:
+        r = scale_read.read(cam.latest())
+        return None if r is None else float(r[0])
+
+    def sample(phase: str, w: float | None) -> None:
+        g_pos = float(arm.state7()[6])
+        rows.append([round(time.time() - t0, 3), phase, round(arm.grip, 4), round(g_pos, 4), round(load(arm, 2), 3),
+                     round(SKIN.magnitude(), 1) if SKIN is not None else "", "" if w is None else w])
+
+    def settled(seconds: float, phase: str) -> float | None:
+        vals, end = [], time.time() + seconds
+        while time.time() < end:
+            w = reading()
+            sample(phase, w)
+            if w is not None:
+                vals.append(w)
+            time.sleep(0.12)
+        return float(np.median(vals[-5:])) if vals else None
+
+    refirm(arm, q0, args.grip_load, "tilted")  # tilting takes load off the jaw: firm it before it slides
+    base = settled(1.5, "tare")
+    if base is None:
+        print("   !! the scale display cannot be read - not pouring")
+        return None
+    print(f"   scale before the pour: {base:.1f} oz; pouring {target:.1f} oz -> {base + target:.1f} oz")
+    if abs(base) > 0.3:
+        # the bowl was tared: a reading now means the bottle (or the arm) rests on the scale - its weight would
+        # swamp the pour and the stop would never come
+        print(f"   !! the scale reads {base:.1f} oz before pouring (expected ~0 with the bowl tared): something rests "
+              "on it - not squeezing")
+        return None
+    goal = base + target
+    q = np.array(arm.last_cmd[:6], dtype=float)
+    g_hold = arm.grip  # the held grip: never open wider than this while the bottle hangs in the jaw
+    g_min = max(0.0, g_hold - args.pour_max_squeeze / JAW_STROKE)
+    s_hold = SKIN.magnitude() if SKIN is not None else None
+    s_cap = args.skin_max if args.skin_max is not None else (None if s_hold is None else 3.0 * max(s_hold, 100.0))
+    g_flow = None  # the grip at which it first flowed: top-up pulses start just before it
+    w_hist: list[tuple[float, float]] = []  # (t, reading) while squeezing
+    final = base
+    for pulse in range(1, 6):
+        stop_reason = "limit"
+        misses, stalled = 0, 0.0
+        while arm.grip > g_min:
+            w = reading()
+            sample(f"squeeze{pulse}", w)
+            if w is None:
+                misses += 1
+                if misses * POUR_DT > 3.0:
+                    stop_reason = "display unreadable"
+                    break
+                time.sleep(POUR_DT)
+                continue
+            misses = 0
+            now = time.time()
+            w_hist.append((now, w))
+            if g_flow is None and w >= base + 0.2:
+                g_flow = arm.grip
+                print(f"   flowing at {(g_hold - arm.grip) * JAW_STROKE * 1000:.1f} mm past the held grip "
+                      f"(skin {SKIN.magnitude():.0f})" if SKIN is not None else "   flowing")
+            recent = [(t, v) for t, v in w_hist if now - t <= 1.5]
+            rate = max(0.0, (recent[-1][1] - recent[0][1]) / max(recent[-1][0] - recent[0][0], 0.3)) if len(recent) >= 2 else 0.0
+            if w + rate * POUR_LAG >= goal - 0.05:
+                stop_reason = f"at {w:.1f} oz, flowing {rate:.2f} oz/s"
+                break
+            if s_cap is not None and SKIN is not None and SKIN.magnitude() >= s_cap:
+                stop_reason = "the skin cap"
+                break
+            g_pos, g_load = float(arm.state7()[6]), load(arm, 2)
+            if g_load >= args.pour_load_max:
+                # the motor is at its squeeze budget: winding the command further only runs it into the force cap
+                # (attempt 1: 8 mm commanded past where the jaw stood, load 1.04) and adds nothing
+                stop_reason = f"the load cap ({g_load:.2f})"
+                break
+            if arm.grip < g_pos - POUR_MAX_LEAD:
+                # the jaw lags the command: the wall pushes back - wait for it instead of winding further
+                stalled += POUR_DT
+                if stalled > 3.0:
+                    stop_reason = f"stalled {(g_hold - g_pos) * JAW_STROKE * 1000:.1f} mm in, load {g_load:.2f}"
+                    break
+                time.sleep(POUR_DT)
+                continue
+            stalled = 0.0
+            arm.grip = max(g_min, arm.grip - (POUR_STEP_FLOW if g_flow is not None else POUR_STEP_DRY))
+            arm._cmd(q)
+            if live is not None:
+                live.set(phase=f"squeeze-pour: {w - base:.1f} / {target:.1f} oz")
+            time.sleep(POUR_DT)
+        # stop: relax the squeeze a little and softly, from where the jaw actually stands, and let the reading settle
+        arm.grip = min(arm.grip, float(arm.state7()[6]))
+        loosen(arm, q, POUR_RELAX)
+        final = settled(POUR_SETTLE, f"settle{pulse}")
+        poured = None if final is None else final - base
+        print(f"   pulse {pulse}: stopped ({stop_reason}); settled at "
+              + ("unreadable" if final is None else f"{final:.1f} oz - poured {poured:.1f} of {target:.1f} oz"))
+        if final is None or stop_reason in ("display unreadable", "the skin cap"):
+            break
+        if poured >= target - POUR_TOL:
+            break
+        if stop_reason.startswith(("the load cap", "stalled")) and g_flow is None:
+            print("   !! the bottle cannot be squeezed further and nothing flowed - stopping")
+            break
+        if arm.grip <= g_min + 1e-6 and stop_reason == "limit":
+            print(f"   !! reached the squeeze limit ({args.pour_max_squeeze * 1000:.0f} mm) - stopping short")
+            break
+        # top up: carry on squeezing from where the jaw stands - re-opening to where it first flowed (run 6: from
+        # 29 mm back to 8 mm) let the collapsed bottle go slack in the jaw
+        time.sleep(0.3)
+    # after the pour: loosen very softly and very little from where the jaw stands. Opening back to the held grip
+    # (run 6: 29 mm wider - the squeezed wall does not spring back) leaves the bottle hanging at load 0.06 and it
+    # slides out on the way home
+    loosen(arm, q, POUR_LOOSEN)
+    # the wall creeps and the held load sinks (attempt 2: 0.46 at the grip, 0.10 once tilted, 0.06 after the
+    # squeeze - it slid 2 cm down the jaw on the way home): close back up to the hold load, not to a position
+    refirm(arm, q, args.grip_load, "after the pour")
+    print(f"   after the pour: grip load {load(arm, 2):.2f}" + (f", skin {SKIN.magnitude():.0f}" if SKIN is not None else ""))
+    # the log: tactile skin, gripper command / position / load, and the scale, on one clock
+    out = CAPTURES / "pour"
+    out.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    import csv
+    with (out / f"pour_{stamp}.csv").open("w", newline="") as fh:
+        wr = csv.writer(fh)
+        wr.writerow(["t", "phase", "grip_cmd", "grip_pos", "grip_load", "skin_mag", "scale_oz"])
+        wr.writerows(rows)
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        R = np.array([[r[0], r[2], r[3], r[4], r[5] if r[5] != "" else np.nan, r[6] if r[6] != "" else np.nan]
+                      for r in rows], dtype=float)
+        fig, ax = plt.subplots(4, 1, figsize=(9, 9), sharex=True)
+        ax[0].plot(R[:, 0], R[:, 5] - base, ".-"); ax[0].axhline(target, ls="--", c="k"); ax[0].set_ylabel("poured (oz)")
+        ax[1].plot(R[:, 0], (g_hold - R[:, 1]) * JAW_STROKE * 1000, label="commanded")
+        ax[1].plot(R[:, 0], (g_hold - R[:, 2]) * JAW_STROKE * 1000, label="measured"); ax[1].set_ylabel("squeeze (mm)")
+        ax[1].legend()
+        ax[2].plot(R[:, 0], R[:, 3]); ax[2].set_ylabel("gripper load")
+        ax[3].plot(R[:, 0], R[:, 4]); ax[3].set_ylabel("skin |d|"); ax[3].set_xlabel("s")
+        fig.suptitle(f"squeeze-pour {target:.1f} oz: settled {'?' if final is None else f'{final - base:.1f}'} oz")
+        fig.tight_layout(); fig.savefig(out / f"pour_{stamp}.png", dpi=110); plt.close(fig)
+    except Exception as e:
+        print(f"   (no pour plot: {e})")
+    print(f"   pour log: {out / f'pour_{stamp}.csv'} (+ .png)")
+    if live is not None and final is not None:
+        live.set(phase=f"poured {final - base:.1f} oz (target {target:.1f})")
+    return final
+
+
 def weigh_readout(seconds: float, live: LiveState | None = None) -> list[Path]:
     """Wait on the scale and photograph its display: cam2 faces it. A frame half-way (the reading settling) and
     one at the end go to captures/weigh_<cam>_<n>.jpg; the display is read from those."""
@@ -3097,6 +3397,33 @@ def _run_legs(plan: Plan, planner: AzPlanner, arm: Arm, cam: LiveCamera | None, 
                 arm.holding = False
                 bail(arm, planner, ws, plan, False, "the grasp was lost at the hold test (empty jaw)")
                 return False
+        elif wp.kind == "squeeze":
+            if not holding:
+                bail(arm, planner, ws, plan, False, "nothing in the gripper to pour from")
+                return False
+            q_level = np.array(arm.last_cmd[:6], dtype=float)
+            P = plan.pour
+            tilt_path = None
+            if args.pour_tilt_deg > 0:
+                # where the bottle is now (level): its axis at the place point, its base pour_base_z up
+                base = np.array([plan.place[0], plan.place[1], float(P["base_z"])])
+                tip = base + np.array(P["tip"])
+                lip = np.array([P["tip_at"][0], P["tip_at"][1], args.pour_lip])
+                bowl = tuple(float(v) for v in args.pour_bowl.split(",")) if args.pour_bowl else None
+                tilt_path = bottle_tilt_path(planner, ws, q_level, base, tip, lip, np.radians(args.pour_tilt_deg), bowl)
+                if tilt_path is None:
+                    print("   !! no safe tilt toward the bowl - not pouring")
+                else:
+                    print(f"   tilting the bottle {args.pour_tilt_deg:.0f} deg toward the bowl, spout tip down to "
+                          f"({lip[0]:+.3f}, {lip[1]:+.3f}, {lip[2]:.3f})")
+                    if live is not None:
+                        live.set(phase=f"tilting {args.pour_tilt_deg:.0f} deg toward the bowl")
+                    arm.glide_path(tilt_path, 4.0)
+                    time.sleep(0.5)
+            if args.pour_tilt_deg <= 0 or tilt_path is not None:
+                squeeze_pour(arm, plan, args, live)
+            if tilt_path is not None:
+                arm.glide_path(list(reversed(tilt_path[:-1])) + [q_level], 3.0)  # back to level
         elif wp.kind == "hold":
             if args.pour_over and holding:
                 do_pour(arm, planner, ws, plan, args)
@@ -3312,6 +3639,26 @@ class Args:
     palm: bool = False
     """Seat the object against the palm: full depth only, and the gripper housing may come to 4 mm of the target
     (it is meant to touch it). For big objects (a wash bottle's body) where the whole jaw must be engaged."""
+    pour_oz: float | None = None
+    """Squeeze-pour this many ounces into a bowl on the scale (read live off its display by cam2, scale_read.py),
+    then put the bottle back. Needs --pour-at, --pour-tip."""
+    pour_at: str | None = None
+    """"x,y": where the spout tip should be (over the bowl, a few cm inside its rim)."""
+    pour_tip: str | None = None
+    """"dx,dy,dz": the spout tip relative to the bottle's axis at its base (measured before the pick)."""
+    pour_base_z: float = 0.07
+    """Height of the bottle's base while it pours (above the scale top when the body overhangs the scale)."""
+    pour_tilt_deg: float = 35.0
+    """Tilt the held bottle this far toward the bowl before squeezing (about the axis square to its spout), so the
+    spout points down into it. 0: pour level."""
+    pour_lip: float = 0.16
+    """Height (m) the spout tip is brought down to at full tilt (a few cm above the bowl's rim)."""
+    pour_bowl: str | None = None
+    """"x,y,radius,rim_z": the bowl, kept clear of the tilting bottle and arm."""
+    pour_load_max: float = 0.85
+    """--pour-oz: stop squeezing at this gripper-motor load (1.0 ~ the --grip-force cap)."""
+    pour_max_squeeze: float = 0.020
+    """m the jaw may close past the held grip while squeezing (a crushing / runaway guard)."""
     station_place: str | None = None
     """--station: "x,y" to set the object down at instead of station.json's place point (must be on the platform) -
     e.g. nearer the base for a heavy object carried high with a flat wrist."""
@@ -3748,6 +4095,14 @@ def main(args: Args) -> None:
         TARGET_TOL = TALL_TOL = 0.004
         SEAT_BACKOFFS = (0.0,)
         print("palm grasp: the object is seated against the gripper housing (full finger depth)")
+    if args.pour_oz is not None:
+        global POUR
+        tx, ty = (float(v) for v in args.pour_at.split(","))
+        dx, dy, dz = (float(v) for v in args.pour_tip.split(","))
+        POUR = {"oz": float(args.pour_oz), "base_z": float(args.pour_base_z), "tip": [dx, dy, dz],
+                "tip_at": [tx, ty], "axis": [tx - dx, ty - dy]}
+        print(f"squeeze-pour {args.pour_oz:.1f} oz: spout tip at ({tx:+.3f}, {ty:+.3f}), "
+              f"{(args.pour_base_z + dz) * 100:.0f} cm up; the bottle axis at ({tx - dx:+.3f}, {ty - dy:+.3f})")
     if args.station:
         STATION = load_station()
         if args.station_place:
