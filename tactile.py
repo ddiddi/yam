@@ -50,6 +50,14 @@ class TactileSkin:
 
         self.port = port or find_port()
         self.ser = serial.Serial(self.port, baud, timeout=0.2)
+        # the skin's board can sit silent after a reconnect (0 bytes in 4 s on 2026-09-24) until the host
+        # toggles DTR and sends a line: wake it on every open
+        self.ser.dtr = False
+        time.sleep(0.3)
+        self.ser.dtr = True
+        self.ser.rts = True
+        time.sleep(0.3)
+        self.ser.write(b"\n")
         self.lock = threading.Lock()
         self.vec: np.ndarray | None = None
         self.n = 0  # samples read

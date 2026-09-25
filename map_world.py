@@ -50,7 +50,12 @@ def _depth(frame) -> tuple[dict, dict]:
     import pick_place as pp
 
     cams = pp.load_cameras()
-    r = depth.analyse(frame, cams[pp.DET], pp.DET)
+    if pp.STATION is None and pp.STATION_FILE.exists():  # the weigh station is furniture, not a depth object
+        pp.STATION = pp.load_station()
+    r = depth.analyse(frame, cams[pp.DET], pp.DET, ignore=pp.station_mask(cams[pp.DET], frame.shape[:2], grow=25))
+    fp = pp.np.array(pp.STATION["footprint"]) if pp.STATION else None
+    if fp is not None:  # depth smears the scale's top edge into the table beside it
+        r["objects"] = [o for o in r["objects"] if pp.poly_sd(o["xy"], fp)[0] >= pp.STATION_DEPTH_BAND]
     H = r["H"]
     grid = [[None if not np.isfinite(v) else int(round(v * 1000)) for v in row] for row in H]
     sensor = {"name": "Depth Anything V2 Small", "runtime": "ONNX Runtime (CPU)", "camera": pp.DET,

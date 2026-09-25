@@ -2,6 +2,25 @@
  "camera": "cam1",
  "polygon": [
   [
+   0.1492,
+   -0.2818
+  ],
+  [
+   0.4257,
+   -0.2888
+  ],
+  [
+   0.4614,
+   0.2574
+  ],
+  [
+   0.0928,
+   0.177
+  ]
+ ],
+ "what": "outer edge of the blue tape incl. the strip added 2026-09-24 on the +y side; the scale inside it is station.json",
+ "white_sheet_polygon": [
+  [
    0.1789,
    0.0277
   ],
@@ -17,29 +36,5 @@
    0.3741,
    0.0303
   ]
- ],
- "pixels": [
-  [
-   702,
-   320
-  ],
-  [
-   352,
-   340
-  ],
-  [
-   288,
-   546
-  ],
-  [
-   710,
-   546
-  ]
- ],
- "sides_m": [
-  0.2681,
-  0.1949,
-  0.2642,
-  0.1952
  ]
 }

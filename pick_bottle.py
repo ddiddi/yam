@@ -671,13 +671,16 @@ def soft_close(arm: "Arm", start: float | None = None, preload: float = 0.005, s
     target = e0 + hold_load
     print(f"   soft contact at {touch * 95:.1f} mm ({why}); settling the load at {target:.2f}")
     ok = 0
-    for _ in range(60):  # load servo on the grip command
+    # load servo on the grip command. The finger pads' skin is soft: a firm target needs 10+ mm of pad
+    # compression past the first touch, so the budget must reach that (60 half-steps = 5.7 mm ran out on a
+    # bottle cap at load 0.33 of a 0.46 target, every time)
+    for _ in range(160):
         e = load(arm, 6)
         if e > target + band:
             g = min(1.0, g + step * (2 if e > target + 3 * band else 1))  # squeezing too hard: open
             ok = 0
         elif e < target - band:
-            g = max(0.0, g - step / 2)  # lost the load: close a little
+            g = max(0.0, g - (step if e < target - 3 * band else step / 2))  # below it: close (faster when far)
             ok = 0
         else:
             ok += 1
@@ -690,8 +693,13 @@ def soft_close(arm: "Arm", start: float | None = None, preload: float = 0.005, s
     m = float(arm.state7()[6])
     e = load(arm, 8)
     good = abs(e - target) <= band  # the load decides: stalled fingers alone may be squeezing too hard
+    # a high target can sit above what the gripper's force cap lets the motor reach: the load plateaus and the
+    # servo only presses the finger pads' skin in. A plateau most of the way to the target is a firm grip
+    capped = not good and target - band > e >= e0 + 0.75 * (target - e0)
+    good = good or capped
     print(f"   grip check: opening {m * 95:.1f} mm ({(touch - m) * 95:+.1f} mm past the touch), load {e:.2f} "
-          f"(target {target:.2f}) -> " + ("OK, lifting" if good and e > e0 + 0.03 else "NO LOAD - not holding"))
+          f"(target {target:.2f}) -> " + (("OK (firm: the load plateaus under the force cap), lifting" if capped else "OK, lifting")
+                                         if good and e > e0 + 0.03 else "NO LOAD - not holding"))
     if not good and e > target + band:  # still too hard after the servo: open to the target load, then accept
         for _ in range(20):
             g = min(1.0, g + step)

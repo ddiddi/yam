@@ -153,6 +153,75 @@ def zone_margin(xy, zone: np.ndarray) -> float:
     return float(cv2.pointPolygonTest(zone.astype(np.float32), (float(xy[0]), float(xy[1])), True))
 
 
+# ---- the weigh station (station.json, from calib_tools/station_calib.py + the measured footprint) -------
+STATION_FILE = HERE / "station.json"
+STATION: dict | None = None  # set by --station: {"top_z", "footprint" [[x, y] x4], "place" [x, y], ...}
+STATION_MARGIN = 0.012  # m: the station is a measured box, not a detection - a tighter margin than MARGIN
+SURFACE_SLACK = 0.003  # m: how far below the station top a point may be over it (the carried object sits ON it)
+STATION_DEPTH_BAND = 0.025  # m: a depth-only object centred this close to the station is its smeared edge
+
+
+def load_station() -> dict:
+    st = json.loads(STATION_FILE.read_text())
+    for k in ("top_z", "footprint", "place"):
+        if k not in st:
+            raise RuntimeError(f"{STATION_FILE.name} has no '{k}' - measure the station first")
+    return st
+
+
+def poly_sd(xy: np.ndarray, poly: np.ndarray) -> np.ndarray:
+    """Signed distance of points to a convex polygon: positive outside, negative inside. Outside it is the
+    largest edge-line distance, which never exceeds the true distance - clearances come out conservative."""
+    P = np.asarray(poly, dtype=float)
+    a, b = P[1] - P[0], P[2] - P[1]
+    if a[0] * b[1] - a[1] * b[0] < 0:
+        P = P[::-1]  # counter-clockwise: the outward normal of edge a->b is (dy, -dx)
+    e = np.roll(P, -1, axis=0) - P
+    n = np.c_[e[:, 1], -e[:, 0]] / np.linalg.norm(e, axis=1)[:, None]
+    q = np.atleast_2d(np.asarray(xy, dtype=float))
+    return ((q[:, None, :] - P[None, :, :]) * n[None, :, :]).sum(-1).max(axis=1)
+
+
+def station_obj() -> "Obj | None":
+    if STATION is None:
+        return None
+    fp = np.array(STATION["footprint"], dtype=float)
+    return Obj("scale", tuple(fp.mean(axis=0)), 0.0, float(STATION["top_z"]), (40, 40, 40), measured=True,
+               dims_from="station.json", poly=fp)
+
+
+def surface_z(xy) -> float:
+    """What an object at xy stands on: the station top over its footprint, the table elsewhere."""
+    if STATION is not None and poly_sd(np.array(xy)[:2], np.array(STATION["footprint"]))[0] <= 0:
+        return float(STATION["top_z"])
+    return 0.0
+
+
+def station_mask(cam: "CameraModel", shape: tuple[int, int], grow: int = 15) -> np.ndarray | None:
+    """The station box (top and sides) in a camera image: detection ignores it. It is in the backgrounds, but
+    an object set on it would otherwise read as one standing on the table, and depth would fit the table
+    plane to its top."""
+    if STATION is None:
+        return None
+    fp = np.array(STATION["footprint"], dtype=float)
+    box = np.vstack([np.c_[fp, np.zeros(len(fp))], np.c_[fp, np.full(len(fp), STATION["top_z"])]])
+    uv = cam.project(box)
+    m = np.zeros(shape, np.uint8)
+    if np.isfinite(uv).all():
+        cv2.fillConvexPoly(m, cv2.convexHull(np.clip(uv, -1e5, 1e5).astype(np.int32)), 255)
+    return cv2.dilate(m, np.ones((2 * grow + 1, 2 * grow + 1), np.uint8))
+
+
+def box_hits(pts: np.ndarray, o: "Obj", margin: float) -> np.ndarray:
+    """Points of pts (N x 3) inside a station box's no-go volume: below its top (less SURFACE_SLACK) and
+    within `margin` of its footprint."""
+    low = pts[:, 2] < o.height - SURFACE_SLACK
+    out = np.zeros(len(pts), bool)
+    if low.any():
+        out[low] = poly_sd(pts[low, :2], o.poly) < margin
+    return out
+
+
 # ============================================================================== step 1: identify
 @dataclass
 class Obj:
@@ -170,11 +239,27 @@ class Obj:
     angle: float | None = None
     dims_from: str = "single view (depth not measured: treated as round)"
     xy_uncertain: bool = False  # found by depth alone: its position along the line of sight is +-2 cm
+    # a fixed box (the weigh station): its footprint polygon (N x 2, robot frame). `height` is its top, which
+    # is a surface things are set down on - nothing may go below it over the footprint, anything may go above
+    poly: np.ndarray | None = field(repr=False, default=None)
+    # (z_from, diameter): above z_from the object is only this wide - a bottle's screw cap. With a neck the jaw
+    # closes on the neck (the grasp height must be inside it) and the arm may come that close to the axis there
+    neck: tuple | None = None
 
     @property
     def grip_width(self) -> float:
-        """What the jaw must span: the footprint's short side when it is measured, else the diameter."""
+        """What the jaw must span: the neck when one is given, the footprint's short side when it is measured,
+        else the diameter."""
+        if self.neck is not None:
+            return float(self.neck[1])
         return self.width if self.width is not None else self.diameter
+
+    def radius_at(self, z) -> np.ndarray:
+        """The no-touch radius at height(s) z above the object's base: the neck's above z_from."""
+        z = np.asarray(z, dtype=float)
+        if self.neck is None:
+            return np.full(z.shape, self.radius)
+        return np.where(z >= self.neck[0], self.neck[1] / 2, self.radius)
 
     @property
     def long_axis(self) -> np.ndarray | None:
@@ -656,7 +741,9 @@ def still_cameras(frames: dict[str, np.ndarray], models: dict) -> dict:
 
 def grab_more(key: str, n: int) -> list[np.ndarray]:
     """n more frames of one camera, ~0.35 s apart (one open of the device)."""
-    cap = cv2.VideoCapture(int(key[3:]))
+    from scene3d import device_index  # YAM_CAM_MAP: after a replug camN is not always OpenCV index N
+
+    cap = cv2.VideoCapture(device_index(int(key[3:])))
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
     out = []
@@ -787,6 +874,13 @@ class Workspace:
         """Smallest gap between any point and any object's no-go cylinder (negative = inside it)."""
         worst, who = 1e9, ""
         for o in self.obstacles:
+            if o.poly is not None:  # the station box: its top is a surface, only what goes below it counts
+                low = pts[:, 2] < o.height - SURFACE_SLACK
+                if low.any():
+                    gap = float(poly_sd(pts[low, :2], o.poly).min()) - STATION_MARGIN
+                    if gap < worst:
+                        worst, who = gap, o.name
+                continue
             low = pts[:, 2] < o.height + 0.01  # points above an object sail over it
             if not low.any():
                 continue
@@ -801,11 +895,13 @@ class Workspace:
         gripper housing could brush a tall object on the way in or out and tip it over."""
         if self.target is None:
             return 1e9
-        xy, r, h, tol = self.target
-        sel = ~self.is_tip & (pts[: len(self.is_tip), 2] < h + 0.01)
+        xy, r, h, tol, obj, base = self.target
+        P = pts[: len(self.is_tip)]
+        sel = ~self.is_tip & (P[:, 2] < h + 0.01)
         if not sel.any():
             return 1e9
-        return float(np.linalg.norm(pts[: len(self.is_tip)][sel, :2] - np.asarray(xy), axis=1).min()) - r - tol
+        rr = obj.radius_at(P[sel, 2] - base)  # a neck lets the arm closer up there
+        return float((np.linalg.norm(P[sel, :2] - np.asarray(xy), axis=1) - rr).min()) - tol
 
     def scan(self, q_from: np.ndarray, q_to: np.ndarray, carry=None, n: int = 12) -> tuple[float, str, float]:
         """Sweep the straight joint-space path the arm will actually glide through: worst clearance from
@@ -829,13 +925,15 @@ class Workspace:
         return worst, who, zmin
 
     def aim(self, obj: Obj | None, xy=None) -> None:
-        """Where the target stands now (None while it hangs in the gripper)."""
+        """Where the target stands now (None while it hangs in the gripper). On the station its body starts at
+        the station top, so its no-touch height is measured from there."""
         if obj is None:
             self.target = None
         else:
             h = safe_height(obj)
             tol = TALL_TOL if h > TALL_H else TARGET_TOL
-            self.target = (tuple(xy if xy is not None else obj.xy), obj.radius, h, tol)
+            at = tuple(xy if xy is not None else obj.xy)
+            self.target = (at, obj.radius, h + surface_z(at), tol, obj, surface_z(at))
 
 
 def arm_mask(ws: Workspace, cam: CameraModel, q6: np.ndarray, shape: tuple[int, int],
@@ -872,11 +970,19 @@ def carried_points(obj: Obj, z_grasp: float, ahead=(0.0, 0.0)):
     return f
 
 
+def grasp_half(obj: "Obj") -> float:
+    """Half the object's extent along a side grasp's approach where the jaw closes: the neck's radius when the
+    grasp is on a neck, half the length of a long object (entered along it), else the radius."""
+    if obj.neck is not None:
+        return float(obj.neck[1]) / 2
+    return obj.length / 2 if obj.long_axis is not None else obj.radius
+
+
 def side_deep(obj: "Obj", zg: np.ndarray) -> float:
     """Horizontal distance a side grasp's fingertips travel PAST the object's axis, so the axis crosses the
     fingers seat_depth - (half the object along the approach) from their tips: the object sits at the base
     of the fingers. zg is the (unit, 3D) approach direction; its horizontal part scales depth to xy."""
-    half = obj.length / 2 if obj.long_axis is not None else obj.radius  # a long object is entered along its length
+    half = grasp_half(obj)  # a long object is entered along its length; a neck is what the jaw closes on
     s = max(0.0, seat_depth(obj) - half)  # the axis' depth from the tips
     return float(s * np.linalg.norm(zg[:2]))
 
@@ -995,7 +1101,10 @@ def free_gap(xy, obstacles: list[Obj], extra: float = 0.0) -> tuple[float, str]:
     """Analytic clearance of a point (inflated by `extra`) from the no-go cylinders; a fast pre-filter."""
     worst, who = 1e9, ""
     for o in obstacles:
-        gap = float(np.linalg.norm(np.asarray(xy) - np.array(o.xy))) - o.radius - extra - MARGIN
+        if o.poly is not None:
+            gap = float(poly_sd(np.asarray(xy)[:2], o.poly)[0]) - extra - STATION_MARGIN
+        else:
+            gap = float(np.linalg.norm(np.asarray(xy) - np.array(o.xy))) - o.radius - extra - MARGIN
         if gap < worst:
             worst, who = gap, o.name
     return worst, who
@@ -1054,6 +1163,7 @@ class WP:
     q: np.ndarray | None = None  # for kind "pose": the joint target, xyz being only its FK position
     qs: list | None = None  # the joint path `validate` checked for this leg; `execute` follows exactly this
     release: bool = False  # this waypoint lets go of the object (its grip may be only part-open)
+    at: tuple | None = None  # where the object stands once this waypoint lets go of it (default: the place point)
 
 
 @dataclass
@@ -1081,13 +1191,17 @@ class Plan:
     servo_dist: float = SERVO_OFFSET  # m from the pick point to the visual-check point, towards the camera
     lead: list = field(default_factory=list)  # validated legs out of the visual check to above the object
     servo_dir: tuple | None = None  # unit xy direction from the pick point to the check point
+    station: dict | None = None  # --station: the place point is the scale top; the object then goes back to `pick`
+    weigh: float = 0.0  # --station: seconds the object sits on the scale, the gripper clear of it
 
     def to_json(self) -> dict:
         return {
             "object": {"name": self.obj.name, "xy": list(self.obj.xy), "diameter": self.obj.diameter,
                        "height": self.obj.height, "flatness": self.obj.flatness},
-            "obstacles": [{"name": o.name, "xy": list(o.xy), "diameter": o.diameter, "height": o.height}
+            "obstacles": [{"name": o.name, "xy": list(o.xy), "diameter": o.diameter, "height": o.height,
+                           **({"footprint": np.asarray(o.poly).tolist()} if o.poly is not None else {})}
                           for o in self.obstacles],
+            "station": self.station,
             "grasp": {"mode": self.mode, "reason": self.reason, "yaw": self.yaw, "tilt": self.tilt,
                       "approach_azimuth": self.az, "z_grasp": self.z_grasp, "open_grip": self.open_grip},
             "pick": list(self.pick), "place": list(self.place), "z_travel": self.z_travel,
@@ -1101,9 +1215,15 @@ class Plan:
 
 def build_waypoints(planner: AzPlanner, obj: Obj, mode: str, yaw: float, tilt: float, az: float | None,
                     pick: tuple[float, float], place: tuple[float, float], z_grasp: float, z_travel: float,
-                    open_grip: float, hold: float, pause: float = 0.0, park: str = "rest") -> list[WP]:
+                    open_grip: float, hold: float, pause: float = 0.0, park: str = "rest",
+                    station: dict | None = None, weigh: float = 0.0) -> list[WP]:
+    """With `station`: the place point is on the scale top (every place height rises by its top_z); after the
+    release the gripper backs off and waits `weigh` s, takes the object again exactly as it let go of it, and
+    sets it down back where it was picked (`at` on each release says where the object then stands)."""
     x, y = pick
     px, py = place
+    dz = float(station["top_z"]) if station else 0.0  # the place surface's height
+    zp = z_grasp + dz  # fingertip height at the place point
     # the arm stops and re-reads the table at the two points where it is about to commit to something:
     # just before it descends on the object, and just before it carries it across the desk
     look1 = [WP("look at the scene again", (x, y, z_travel), pause, kind="rescan")] if pause > 0 else []
@@ -1127,10 +1247,11 @@ def build_waypoints(planner: AzPlanner, obj: Obj, mode: str, yaw: float, tilt: f
         shift = (side_deep(obj, zg) - SLIDE_SHORT) * u
         x, y = x + shift[0], y + shift[1]
         px, py = px + shift[0], py + shift[1]
-        half = obj.length / 2 if obj.long_axis is not None else obj.radius
+        half = grasp_half(obj)
         back = max(SIDE_APPROACH, seat_depth(obj) + half + 0.04)
         pre = tuple(np.array([x, y, z_grasp]) - back * zg)
-        pre_place = tuple(np.array([px, py, z_grasp]) - back * zg)
+        pre_place = tuple(np.array([px, py, zp]) - back * zg)
+        on = "onto the scale" if station else "the place point"
         wps += [
             WP("pre-grasp beside the object", pre, 3.0, settle=True),
             WP("slide the fingers around it", (x, y, z_grasp), 3.0, settle=True),
@@ -1138,12 +1259,25 @@ def build_waypoints(planner: AzPlanner, obj: Obj, mode: str, yaw: float, tilt: f
             WP("lift", (x, y, z_travel), 3.0),
             WP(f"hold {hold:.0f} s", (x, y, z_travel), hold, kind="hold"),
         ] + look2 + [
-            WP("carry to the place point", (px, py, z_travel), 3.5),
-            WP("lower", (px, py, z_grasp), 3.0, settle=True),
-            WP("release", (px, py, z_grasp), 1.5, grip=GRIP_OPEN),
+            WP("carry onto the scale" if station else "carry to the place point", (px, py, z_travel), 3.5),
+            WP("lower onto the scale" if station else "lower", (px, py, zp), 3.0, settle=True),
+            WP("release", (px, py, zp), 1.5, grip=GRIP_OPEN, at=tuple(place)),
             WP("back the fingers out", pre_place, 2.5),
-            WP("clear of the table", (px, py, z_travel), 2.5),
+            WP("clear of the scale" if station else "clear of the table", (px, py, z_travel), 2.5),
         ]
+        if station:
+            wps += [
+                WP(f"weigh {weigh:.0f} s", (px, py, z_travel), weigh, kind="hold"),
+                WP("back beside it on the scale", pre_place, 3.0, settle=True),
+                WP("slide the fingers around it again", (px, py, zp), 3.0, settle=True),
+                WP("close on it on the scale", (px, py, zp), 0.0, kind="close"),
+                WP("lift off the scale", (px, py, z_travel), 3.0),
+                WP("carry back to where it was", (x, y, z_travel), 3.5),
+                WP("lower back down", (x, y, z_grasp), 3.0, settle=True),
+                WP("release it back", (x, y, z_grasp), 1.5, grip=GRIP_OPEN, at=tuple(pick)),
+                WP("back the fingers out again", pre, 2.5),
+                WP("clear of the table", (x, y, z_travel), 2.5),
+            ]
     else:
         wps += [
             WP("above the grasp height", (x, y, z_grasp + 0.03), 3.0, settle=True),
@@ -1152,13 +1286,26 @@ def build_waypoints(planner: AzPlanner, obj: Obj, mode: str, yaw: float, tilt: f
             WP("lift", (x, y, z_travel), 3.0),
             WP(f"hold {hold:.0f} s", (x, y, z_travel), hold, kind="hold"),
         ] + look2 + [
-            WP("carry to the place point", (px, py, z_travel), 3.5),
-            WP("lower", (px, py, z_grasp), 3.0, settle=True),
+            WP("carry onto the scale" if station else "carry to the place point", (px, py, z_travel), 3.5),
+            WP("lower onto the scale" if station else "lower", (px, py, zp), 3.0, settle=True),
             # let go only as wide as the pick opening: a tilted wrist opened fully this low puts a fingertip
             # into the table. It opens fully once it is up.
-            WP("release", (px, py, z_grasp), 1.5, grip=open_grip, release=True),
-            WP("clear of the table", (px, py, z_travel), 2.5, grip=GRIP_OPEN),
+            WP("release", (px, py, zp), 1.5, grip=open_grip, release=True, at=tuple(place)),
+            WP("clear of the scale" if station else "clear of the table", (px, py, z_travel), 2.5, grip=GRIP_OPEN),
         ]
+        if station:
+            wps += [
+                WP(f"weigh {weigh:.0f} s", (px, py, z_travel), weigh, kind="hold"),
+                # back down around it at the pick opening again (fully open, a tilted wrist hangs a tip low)
+                WP("above it on the scale", (px, py, zp + 0.03), 3.0, settle=True, grip=open_grip),
+                WP("descend onto it on the scale", (px, py, zp), 1.5, settle=True),
+                WP("close on it on the scale", (px, py, zp), 0.0, kind="close"),
+                WP("lift off the scale", (px, py, z_travel), 3.0),
+                WP("carry back to where it was", (x, y, z_travel), 3.5),
+                WP("lower back down", (x, y, z_grasp), 3.0, settle=True),
+                WP("release it back", (x, y, z_grasp), 1.5, grip=open_grip, release=True, at=tuple(pick)),
+                WP("clear of the table", (x, y, z_travel), 2.5, grip=GRIP_OPEN),
+            ]
     wps.append(WP("fold back to ready", ready, 3.5, kind="pose", q=np.array(READY)))
     if park == "rest":
         wps.append(WP("return to rest", (0.0, 0.0, 0.0), 3.0, kind="rest"))
@@ -1223,7 +1370,7 @@ def _walk(planner, ws, plan, q, step, wps, holding, carry, worst, who, legs, low
             full_open = True
         if wp.release or (wp.grip is not None and wp.grip >= GRIP_OPEN - 1e-6):
             if holding:
-                ws.aim(plan.obj, plan.place)  # released: it stands at the place point from here on
+                ws.aim(plan.obj, wp.at or plan.place)  # released: it stands where this leg set it down
             holding = False
         legs.append((wp.label, gap))
         low = min(low, zmin)
@@ -1271,7 +1418,7 @@ def grasp_candidates(planner: AzPlanner, ws: Workspace, obj: Obj, mode: str, pic
         across = JAW_ACROSS if JAW_ACROSS is not None else obj.long_axis
         if across is not None and abs(float(jd @ across)) > np.sin(np.radians(JAW_ALIGN_DEG)):
             continue  # the jaw would close along the long side: too wide, or fingertips landing on a handle
-        half = obj.grip_width / 2 if across is not None else obj.radius
+        half = obj.grip_width / 2 if (across is not None or obj.neck is not None) else obj.radius
         probes = [np.array(pick) + s * (half + JAW_GAP + TIP_PROBE) * jd for s in (1, -1)]  # the two tips
         if mode == "side":  # ... and the lane the fingers travel down
             ad = planner.approach_dir(pick, yaw, tilt, az)[:2]
@@ -1289,7 +1436,7 @@ def grasp_candidates(planner: AzPlanner, ws: Workspace, obj: Obj, mode: str, pic
                 tip[:2] += side_deep(obj, zg) * zg[:2] / (np.linalg.norm(zg[:2]) + 1e-9)
             planner.ik(tip[0], tip[1], tip[2], REST, yaw, tilt)
             if mode == "side":
-                half_a = obj.length / 2 if obj.long_axis is not None else obj.radius
+                half_a = grasp_half(obj)
                 pre = tip - max(SIDE_APPROACH, seat_depth(obj) + half_a + 0.04) * zg
                 planner.ik(pre[0], pre[1], pre[2], REST, yaw, tilt)
         except RuntimeError:
@@ -1428,9 +1575,9 @@ def check_servo_point(planner: AzPlanner, ws: Workspace, plan: Plan) -> None:
 
 def as_circles(o: Obj) -> list[Obj]:
     """An elongated obstacle as a chain of short-side-wide cylinders along its length (the planner's
-    clearance model is cylinders); a round one as itself."""
+    clearance model is cylinders); a round one - or the station box - as itself."""
     ax = o.long_axis
-    if ax is None:
+    if ax is None or o.poly is not None:
         return [o]
     n = int(np.ceil((o.length - o.width) / (o.width / 2))) + 1
     return [Obj(f"{o.name}[{k}]", (o.xy[0] + t * ax[0], o.xy[1] + t * ax[1]), o.width, o.height, o.color)
@@ -1473,6 +1620,15 @@ def make_plan(objs: list[Obj], index: int, args: "Args", planner: AzPlanner) -> 
 def _make_plan(objs: list[Obj], index: int, args: "Args", planner: AzPlanner) -> Plan:
     obj = objs[index]
     obstacles = [c for i, o in enumerate(objs) if i != index for c in as_circles(o)]
+    st_obj = station_obj()
+    if st_obj is not None:
+        obstacles.append(st_obj)
+        # the object must stand on the scale top, not hang over its edge
+        cs, fr = obj.footprint(STATION["place"])
+        over = float(poly_sd(cs, st_obj.poly).max()) + fr
+        if over > -0.01:
+            raise RuntimeError(f"{obj.name} would not fit on the scale top at {STATION['place']}: its footprint comes "
+                               f"{(over + 0.01) * 100:.1f} cm too close to the edge")
     if not (REACH[0] <= obj.reach <= REACH[1]):
         raise RuntimeError(f"{obj.name} is {obj.reach:.2f} m from the base: outside the safe reach {REACH}")
     mode, reason = decide_grasp(obj)
@@ -1495,7 +1651,7 @@ def _make_plan(objs: list[Obj], index: int, args: "Args", planner: AzPlanner) ->
             if m == "side":
                 # the fingers slope down to their tips (SIDE_TILT from vertical): at full depth they cross the
                 # object's axis this much higher than the tips - it must still be the object's lower part
-                half = obj.length / 2 if obj.long_axis is not None else obj.radius
+                half = grasp_half(obj)
                 global _TILTS_OK
                 tilts = SIDE_TILTS or (SIDE_TILT,)
                 rise = max(0.0, seat_depth(obj) - half)
@@ -1515,7 +1671,9 @@ def _make_plan(objs: list[Obj], index: int, args: "Args", planner: AzPlanner) ->
             for yaw, tilt, az in cands:
                 try:
                     place_dir = args.place_dir
-                    if args.shuttle and place_dir is None:  # repeated runs go back and forth between two spots
+                    if STATION is not None:
+                        place = tuple(float(v) for v in STATION["place"])
+                    elif args.shuttle and place_dir is None:  # repeated runs go back and forth between two spots
                         zone = load_zone()
                         if zone is not None:  # towards the zone's middle; from the middle, back out the way it came
                             to_mid = zone.mean(axis=0) - np.array(obj.xy)
@@ -1523,23 +1681,26 @@ def _make_plan(objs: list[Obj], index: int, args: "Args", planner: AzPlanner) ->
                             place_dir = ang if np.linalg.norm(to_mid) > args.place_dist / 2 else ang + 180.0
                         else:
                             place_dir = 0.0 if obj.reach < SHUTTLE_R else 180.0
-                    try:
-                        place = choose_place(planner, ws, obj, obj.xy, yaw, tilt, az, z_grasp, z_travel,
-                                             args.place_dist, place_dir)
-                    except RuntimeError:
-                        if place_dir is None or args.place_dir is not None:
-                            raise
-                        # the shuttle's preferred direction is blocked: any free direction will do
-                        place = choose_place(planner, ws, obj, obj.xy, yaw, tilt, az, z_grasp, z_travel,
-                                             args.place_dist, None)
+                    if STATION is None:
+                        try:
+                            place = choose_place(planner, ws, obj, obj.xy, yaw, tilt, az, z_grasp, z_travel,
+                                                 args.place_dist, place_dir)
+                        except RuntimeError:
+                            if place_dir is None or args.place_dir is not None:
+                                raise
+                            # the shuttle's preferred direction is blocked: any free direction will do
+                            place = choose_place(planner, ws, obj, obj.xy, yaw, tilt, az, z_grasp, z_travel,
+                                                 args.place_dist, None)
                     gap_side = TALL_JAW_GAP if (safe_height(obj) > TALL_H or obj.xy_uncertain) else JAW_GAP
                     open_grip = float(min(GRIP_OPEN, (obj.grip_width + 2 * gap_side) / JAW_STROKE))
                     why = reason if m == mode else f"{reason} -- BUT that failed ({tried[-1]}), fell back to '{m}'"
-                    plan = Plan(obj, obstacles, m, why, yaw, tilt, az, obj.xy, place, z_grasp, z_travel, open_grip)
+                    plan = Plan(obj, obstacles, m, why, yaw, tilt, az, obj.xy, place, z_grasp, z_travel, open_grip,
+                                station=STATION, weigh=args.weigh if STATION is not None else 0.0)
                     pause = args.pause if args.rescan else 0.0
                     for park in ("rest", "ready"):
                         plan.waypoints = build_waypoints(planner, obj, m, yaw, tilt, az, obj.xy, place, z_grasp,
-                                                         z_travel, open_grip, args.hold, pause, park)
+                                                         z_travel, open_grip, args.hold, pause, park,
+                                                         plan.station, plan.weigh)
                         gap, who, legs, low = validate(planner, ws, plan, REST)
                         # something parked against the base only blocks the way home: end upright at READY instead
                         if gap >= 0 or park == "ready" or [l for l, g in legs if g < 0] != ["return to rest"]:
@@ -1547,7 +1708,7 @@ def _make_plan(objs: list[Obj], index: int, args: "Args", planner: AzPlanner) ->
                         print("  the way back to the folded rest pose is blocked; the run will park at READY instead")
                     if gap < 0:
                         leg = min(legs, key=lambda t: t[1])[0]
-                        raise RuntimeError(f"'{leg}' passes {abs(gap) * 100:.1f} cm inside {who}'s no-go cylinder"
+                        raise RuntimeError(f"'{leg}' passes {abs(gap) * 100:.1f} cm inside {who}'s no-go zone"
                                            + (f" (the arm already stands that close to {who} at rest; move it)"
                                               if leg == "unfold to ready" else ""))
                     plan.clearance, plan.tight_at, plan.legs, plan.low_point = gap, who, legs, low
@@ -1580,7 +1741,8 @@ def fragile(plan: "Plan", planner: AzPlanner, ws: "Workspace", args: "Args") -> 
     pause = args.pause if args.rescan else 0.0
     for dx, dy in ((ROBUST_SHIFT, 0), (-ROBUST_SHIFT, 0), (0, ROBUST_SHIFT), (0, -ROBUST_SHIFT)):
         s = np.array([dx, dy])
-        alt = rebuild(plan, planner, tuple(np.array(plan.pick) + s), tuple(np.array(plan.place) + s), args.hold, pause)
+        place = plan.place if plan.station is not None else tuple(np.array(plan.place) + s)  # the scale stays put
+        alt = rebuild(plan, planner, tuple(np.array(plan.pick) + s), place, args.hold, pause)
         try:
             gap, who, _, _ = validate(planner, ws, alt, REST)
         except RuntimeError as e:
@@ -1597,15 +1759,19 @@ def rebuild(plan: Plan, planner: AzPlanner, pick: tuple[float, float], place: tu
     shape, so a leg index stays valid across a rebuild mid-run."""
     p = Plan(plan.obj, plan.obstacles, plan.mode, plan.reason, plan.yaw, plan.tilt, plan.az, pick, place,
              plan.z_grasp, plan.z_travel, plan.open_grip, [], plan.clearance, plan.tight_at, plan.legs,
-             plan.low_point, plan.margin, plan.servo_ok, plan.servo_note, plan.servo_dist, [], plan.servo_dir)
+             plan.low_point, plan.margin, plan.servo_ok, plan.servo_note, plan.servo_dist, [], plan.servo_dir,
+             plan.station, plan.weigh)
     p.waypoints = build_waypoints(planner, plan.obj, plan.mode, plan.yaw, plan.tilt, plan.az, pick, place,
-                                  plan.z_grasp, plan.z_travel, plan.open_grip, hold, pause)
+                                  plan.z_grasp, plan.z_travel, plan.open_grip, hold, pause,
+                                  station=plan.station, weigh=plan.weigh)
     return p
 
 
 def replan(plan: Plan, planner: AzPlanner, pick: tuple[float, float], hold: float, pause: float) -> Plan:
     """Shift the plan onto a corrected pick point (after the visual check); the place point rides along
     on the same offset, which was already validated against the obstacles."""
+    if plan.station is not None:  # the scale does not move with the pick; the way back ends at the corrected pick
+        return rebuild(plan, planner, pick, plan.place, hold, pause)
     off = np.array(plan.place) - np.array(plan.pick)
     return rebuild(plan, planner, pick, tuple(float(v) for v in np.array(pick) + off), hold, pause)
 
@@ -1651,10 +1817,11 @@ def fit_corrected(plan: Plan, planner: AzPlanner, ws: Workspace, cmd: tuple[floa
 
 def _fit_with(plan: Plan, planner: AzPlanner, ws: Workspace, cmd, off, args: "Args", pause: float,
               q: np.ndarray, yaw: float, tilt: float, az: float | None) -> tuple[Plan, float, str, list]:
+    place = plan.place if plan.station is not None else tuple(float(v) for v in np.array(cmd) + off)
     base = Plan(plan.obj, plan.obstacles, plan.mode, plan.reason, yaw, tilt, az, cmd,
-                tuple(float(v) for v in np.array(cmd) + off), plan.z_grasp, plan.z_travel, plan.open_grip,
+                place, plan.z_grasp, plan.z_travel, plan.open_grip,
                 [], plan.clearance, plan.tight_at, plan.legs, plan.low_point, plan.margin, plan.servo_ok,
-                plan.servo_note, plan.servo_dist, [], plan.servo_dir)
+                plan.servo_note, plan.servo_dist, [], plan.servo_dir, plan.station, plan.weigh)
     p = rebuild(base, planner, base.pick, base.place, args.hold, pause)
     gap, who, legs, _ = validate_from_check(planner, ws, p, q)
     if gap < 0:
@@ -1728,7 +1895,8 @@ def merge_objects(known: list[Obj], fresh: list[Obj], mask: np.ndarray,
                   cam: CameraModel) -> tuple[list[Obj], list[str]]:
     """Fresh detections win; an object that has vanished only because the arm is standing in front of
     it keeps its last known position, because it is still there to be knocked over."""
-    out, notes = list(fresh), []
+    out, notes = list(fresh) + [k for k in known if k.poly is not None], []  # the station box is fixed
+    known = [k for k in known if k.poly is None]
     for f in fresh:
         d = min((float(np.hypot(*(np.array(f.xy) - np.array(k.xy)))) for k in known), default=9.0)
         if d > MATCH_R:
@@ -1777,6 +1945,9 @@ def rescan(plan: Plan, planner: AzPlanner, ws: Workspace, arm: Arm, cam: LiveCam
                 c = np.zeros(f.shape[:2], np.uint8)
                 cv2.fillConvexPoly(c, cv2.convexHull(px.astype(np.int32)), 255)
                 m |= cv2.dilate(c, np.ones((41, 41), np.uint8))
+        sm = station_mask(models[k], f.shape[:2])
+        if sm is not None:  # the scale - and whatever stands on it - is not an obstacle on the table
+            m |= sm
         masks[k] = m
     frame, mask = frames[DET], masks[DET]
     near = [plan.pick] + ([(float(tip[0]), float(tip[1]))] if holding else [])
@@ -1811,6 +1982,9 @@ def _recheck(plan: Plan, planner: AzPlanner, ws: Workspace, q: np.ndarray, args:
         print(f"   the rest of the trajectory is clear ({fmt_gap(gap)})")
         return plan, True
     print(f"   the rest of the trajectory would come {abs(gap) * 100:.1f} cm inside {who}")
+    if plan.station is not None:
+        print("   (the place point is the scale: there is no other one to try)")
+        return plan, False
     try:
         place = choose_place(planner, ws, plan.obj, plan.pick, plan.yaw, plan.tilt, plan.az, plan.z_grasp,
                              plan.z_travel, args.place_dist, args.place_dir)
@@ -1831,6 +2005,7 @@ def _recheck(plan: Plan, planner: AzPlanner, ws: Workspace, q: np.ndarray, args:
 
 # the cameras of the fused workspace while a run is going (stage_run fills these)
 FUSED_CAMS: dict = {}
+OPEN_CAMS: dict = {}  # every camera the run has open (recording), fused or not
 FUSED_MODELS: dict = {}
 
 
@@ -1860,7 +2035,9 @@ def show_plan(live: LiveState | None, planner: AzPlanner, plan: Plan) -> None:
              objects=[{"name": plan.obj.name, "axis": list(plan.obj.xy), "diameter": plan.obj.diameter,
                        "height": plan.obj.height, "role": "target"}]
              + [{"name": o.name, "axis": list(o.xy), "diameter": o.diameter, "height": o.height,
-                 "role": "obstacle"} for o in plan.obstacles])
+                 "role": "station" if o.poly is not None else "obstacle",
+                 **({"footprint": np.asarray(o.poly).round(4).tolist()} if o.poly is not None else {})}
+                for o in plan.obstacles])
 
 
 def view_gate(plan: Plan, planner: AzPlanner, ws: Workspace, q_start: np.ndarray, frames: dict | None,
@@ -1876,9 +2053,11 @@ def view_gate(plan: Plan, planner: AzPlanner, ws: Workspace, q_start: np.ndarray
     carry = carried_points(plan.obj, plan.z_grasp, grasp_ahead(planner, plan))
     q = np.array(q_start[:6], dtype=float)
     holding, placed = False, False
+    stands = tuple(plan.pick)  # where the target stands while it is not in the gripper
     swept, bad = [], []
     why = {"obstacles": 0, "depth height map": 0, "target": 0, "carried object": 0}
-    obst = [(np.array(o.xy), o.radius + ws.margin, o.height + 0.01) for o in plan.obstacles]
+    obst = [(np.array(o.xy), o.radius + ws.margin, o.height + 0.01) for o in plan.obstacles if o.poly is None]
+    boxes = [o for o in plan.obstacles if o.poly is not None]
     # the depth height map: every cell that rises above the sheet, detected as an object or not. Cells that
     # belong to the target (inside its circle + tolerance) are left to the target test below.
     hm = None
@@ -1922,14 +2101,18 @@ def view_gate(plan: Plan, planner: AzPlanner, ws: Workspace, q_start: np.ndarray
                 b = np.zeros(len(pts), bool)
                 for c, r, h in obst:
                     b |= (pts[:, 2] < h) & (np.linalg.norm(pts[:, :2] - c, axis=1) < r)
+                for o in boxes:
+                    b |= box_hits(pts, o, STATION_MARGIN)
                 why["obstacles"] += int(b.sum())
                 if hm is not None:
                     bh = ~tip & _below_heightmap(pts, hm)
                     why["depth height map"] += int((bh & ~b).sum())
                     b |= bh
-                if not holding:  # the target standing on the table (pick point, or place point once released)
-                    c = np.array(plan.place if placed else plan.pick)
-                    bt = ~tip & (pts[:, 2] < th + 0.01) & (np.linalg.norm(pts[:, :2] - c, axis=1) < plan.obj.radius + tol)
+                if not holding:  # the target standing where it was last set down (on the table or the scale)
+                    c = np.array(stands)
+                    base = surface_z(stands)
+                    bt = ~tip & (pts[:, 2] < th + base + 0.01) & \
+                        (np.linalg.norm(pts[:, :2] - c, axis=1) < plan.obj.radius_at(pts[:, 2] - base) + tol)
                     why["target"] += int((bt & ~b).sum())
                     b |= bt
                 if holding:
@@ -1937,6 +2120,8 @@ def view_gate(plan: Plan, planner: AzPlanner, ws: Workspace, q_start: np.ndarray
                     cb = np.zeros(len(cp), bool)
                     for c, r, h in obst:
                         cb |= (cp[:, 2] < h) & (np.linalg.norm(cp[:, :2] - c, axis=1) < r)
+                    for o in boxes:  # the carried object's base sits ON the scale top when it is set down
+                        cb |= box_hits(cp, o, STATION_MARGIN)
                     why["carried object"] += int(cb.sum())
                     pts, b = np.vstack([pts, cp]), np.r_[b, cb]
                 swept.append(pts[::3])
@@ -1944,6 +2129,7 @@ def view_gate(plan: Plan, planner: AzPlanner, ws: Workspace, q_start: np.ndarray
             q = q_next
         if (wp.release or (wp.grip is not None and wp.grip >= GRIP_OPEN - 1e-6)) and holding:
             holding, placed = False, True
+            stands = tuple(wp.at or plan.place)
     swept, bad = np.vstack(swept), np.concatenate(bad)
     ok = not bad.any()
     try:
@@ -2020,8 +2206,31 @@ def bail(arm: Arm, planner: AzPlanner, ws: Workspace, plan: Plan, holding: bool,
         if holding:
             move_line(arm, planner, ws, (bx, by, plan.z_travel), plan.yaw, plan.tilt, 2.5)
     except RuntimeError as e:
-        print(f"   could not set it down cleanly ({e}); opening the gripper where it stands")
-        arm.set_grip(GRIP_OPEN, 1.5)
+        if not holding:
+            print(f"   could not clear the object cleanly ({e}); opening the gripper where it stands")
+            arm.set_grip(GRIP_OPEN, 1.5)
+        else:
+            print(f"   could not set it down cleanly ({e})")
+            # the pick spot is where the object itself stood a moment ago: whatever a rescan now reads there is the
+            # object (or its shadow), not something to steer around. Try the way down once more without it.
+            keep = ws.obstacles
+            ws.obstacles = [o for o in keep if o.poly is not None or
+                            float(np.hypot(*(np.array(o.xy) - np.array(plan.pick)))) > plan.obj.radius + MATCH_R]
+            try:
+                move_line(arm, planner, ws, (bx, by, plan.z_travel), plan.yaw, plan.tilt, 3.0)
+                move_line(arm, planner, ws, (bx, by, plan.z_grasp), plan.yaw, plan.tilt, 3.0)
+                settle(arm, planner, bx, by, plan.z_grasp, plan.yaw, plan.tilt)
+                arm.set_grip(GRIP_OPEN, 1.5)
+                move_line(arm, planner, ws, (bx, by, plan.z_travel), plan.yaw, plan.tilt, 2.5)
+                print("   set it down at the pick spot (ignoring what a rescan read on that very spot)")
+            except RuntimeError as e2:
+                # never let go of it in the air: a filled bottle dropped from travel height spills or breaks
+                print(f"!! STILL HOLDING the object and no safe way down ({e2}): TAKE IT FROM THE GRIPPER - it opens "
+                      "in 30 s")
+                time.sleep(30.0)
+                arm.set_grip(GRIP_OPEN, 1.5)
+            finally:
+                ws.obstacles = keep
     safe_park(arm, planner, plan.yaw, plan.tilt)  # straight up first, never a joint-space swing past the object
 
 
@@ -2462,6 +2671,78 @@ HOLD_TEST_LIFT = 0.02  # m: the hold test lift (5 mm passed a dish that slid out
 HOLD_SPEED = 1.0  # --soft: the arm never moves faster than this while it holds the object (a 2x lift dropped the dish)
 
 
+def joint_effort(arm: Arm, n: int = 25, dt: float = 0.012) -> np.ndarray:
+    """The six arm joints' measured torques, averaged over n reads (single reads jitter)."""
+    v = []
+    for _ in range(n):
+        v.append(np.asarray(arm.robot.get_observations()["joint_eff"][:6], dtype=float))
+        time.sleep(dt)
+    return np.mean(v, axis=0)
+
+
+def _lift_pose(planner: AzPlanner, plan: Plan, cmd: np.ndarray) -> np.ndarray:
+    here = planner.fk_pos(cmd)
+    return planner.ik(here[0], here[1], here[2] + HOLD_TEST_LIFT, cmd, plan.yaw, plan.tilt)[0]
+
+
+def empty_lift(arm: Arm, planner: AzPlanner, plan: Plan) -> None:
+    """The arm-torque tare for the hold test: with the jaw still open around the object, go up HOLD_TEST_LIFT and
+    back, reading the joint torques at both ends. The same lift with the object held then differs only by the
+    object's weight - the arm's own gravity, the controller's model error and the joints' static friction cancel."""
+    keep, planner.az = planner.az, plan.az
+    try:
+        cmd = np.array(arm.last_cmd[:6], dtype=float)
+        q_up = _lift_pose(planner, plan, cmd)
+        time.sleep(0.4)
+        e_down = joint_effort(arm)
+        arm.glide(q_up, 1.0)
+        time.sleep(0.8)
+        e_up = joint_effort(arm)
+        arm.glide(cmd, 0.7)
+        time.sleep(0.3)
+        arm.effort_tare = (e_up - e_down, q_up, cmd)
+        print(f"   arm-torque tare (empty jaw, {HOLD_TEST_LIFT * 100:.0f} cm lift): d tau j2 {e_up[1] - e_down[1]:+.3f}, "
+              f"j3 {e_up[2] - e_down[2]:+.3f} Nm")
+    except RuntimeError as e:
+        arm.effort_tare = None
+        print(f"   (no arm-torque tare: {e})")
+    finally:
+        planner.az = keep
+
+
+def felt_mass(arm: Arm, planner: AzPlanner, d_held: np.ndarray) -> float | None:
+    """kg hanging at the fingertips: the torque change of a held lift minus the empty-jaw tare, projected on the
+    torques a unit weight at the grasp site needs (shoulder and elbow carry it). The measured torques' sign
+    convention is taken from the tare itself, which must follow the model's own gravity change."""
+    tare = getattr(arm, "effort_tare", None)
+    if tare is None:
+        return None
+    d_empty, q_up, q_down = tare
+    m, d = planner.model, planner.data
+
+    def bias(q):
+        d.qpos[:] = 0
+        d.qpos[:6] = q
+        d.qvel[:] = 0
+        mujoco.mj_forward(m, d)
+        return d.qfrc_bias[:6].copy()
+
+    dg = bias(q_up) - bias(q_down)  # the model's required-torque change for the empty lift
+    sid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_SITE, "grasp_site")
+    d.qpos[:] = 0
+    d.qpos[:6] = q_up
+    mujoco.mj_forward(m, d)
+    J = np.zeros((3, m.nv))
+    mujoco.mj_jacSite(m, d, J, None, sid)
+    per_kg = J[:, :6].T @ np.array([0.0, 0.0, 9.81])  # required torque per kg held, same convention as dg
+    num = den = 0.0
+    for j in (1, 2):
+        sgn = np.sign(d_empty[j] * dg[j]) if abs(dg[j]) > 0.05 and abs(d_empty[j]) > 0.02 else 1.0
+        num += sgn * (d_held[j] - d_empty[j]) * per_kg[j]
+        den += per_kg[j] ** 2
+    return float(num / den) if den > 1e-9 else None
+
+
 def secure_hold(arm: Arm, planner: AzPlanner, plan: Plan, args: "Args") -> bool:
     """False when the grasp is lost (the jaw is empty): the caller stops instead of carrying nothing."""
     arm.speed_free = getattr(arm, "speed", 1.0)  # restored at the release
@@ -2479,33 +2760,53 @@ def _secure_hold(arm: Arm, planner: AzPlanner, plan: Plan, args: "Args") -> bool
     keep, planner.az = planner.az, plan.az
     try:
         cmd = np.array(arm.last_cmd[:6], dtype=float)
-        here = planner.fk_pos(cmd)
-        q_up, _, _ = planner.ik(here[0], here[1], here[2] + HOLD_TEST_LIFT, cmd, plan.yaw, plan.tilt)
+        q_up = _lift_pose(planner, plan, cmd)
+        skin_first = None
         for k in range(5):
             s_held = SKIN.magnitude() if SKIN is not None else None
+            skin_first = skin_first if skin_first is not None else s_held
+            e_down = joint_effort(arm)
             arm.glide(q_up, 1.0)
             time.sleep(0.8)  # a slow slip shows within a second
             e = load(arm, 8)
+            e_up = joint_effort(arm)
             s_up = SKIN.magnitude() if SKIN is not None else None
-            slip = e < free + 0.5 * (target - free) or (s_held is not None and s_held > 100 and s_up < 0.5 * s_held)
+            kg = felt_mass(arm, planner, e_up - e_down)
+            # three witnesses: the gripper motor still loaded, the skin still pressed, and the ARM carrying the
+            # weight - the last catches an object sliding down the fingers while its base stays on the table
+            light = kg is not None and args.min_mass is not None and kg < args.min_mass
+            slip = (e < free + 0.5 * (target - free) or (s_held is not None and s_held > 100 and s_up < 0.5 * s_held)
+                    or light)
             sk = "" if s_held is None else f", skin {s_held:.0f} -> {s_up:.0f}"
-            print(f"   hold test {k + 1}: load {e:.2f} (free {free:.2f}, target {target:.2f}){sk}: "
-                  + ("slipping - back down, firmer" if slip else "held"))
+            ms = "" if kg is None else f", arm feels {kg * 1000:.0f} g"
+            print(f"   hold test {k + 1}: load {e:.2f} (free {free:.2f}, target {target:.2f}){sk}{ms}: "
+                  + ("slipping - back down, firmer" if slip else "held")
+                  + (f" (under --min-mass {args.min_mass * 1000:.0f} g: it is not lifting it)" if light else ""))
             if not slip:
+                arm.skin_held = s_up
+                arm.felt_kg = kg
                 return
             if e < free + 0.03 and (s_up is None or s_up < 0.8 * (s_held or 1e9) or k > 0):
                 print("   !! the jaw is empty (load at its free level): the grasp was lost - not squeezing harder")
                 arm.glide(cmd, 0.7)
                 return False
             arm.glide(cmd, 0.7)
-            target = min(target + 0.05, free + args.grip_load + 0.10)  # never near the load that flexed the dish
+            cap = args.skin_max if args.skin_max is not None else (3.0 * skin_first if skin_first and skin_first > 50 else None)
+            if SKIN is not None and cap is not None and SKIN.magnitude() >= cap:
+                print(f"   !! the skin reads {SKIN.magnitude():.0f} (cap {cap:.0f}): squeezing harder would crush or squirt it "
+                      "- not firming; it stays on the table")
+                return False
+            # never near the load that flexed the dish (or, for a squeezable bottle, the one that squirts it)
+            target = min(target + 0.05, free + (args.grip_load_max if args.grip_load_max is not None else args.grip_load + 0.10))
             for _ in range(30):  # close in small steps until the load reaches the new target
                 if load(arm, 6) >= target:
                     break
                 arm.grip = max(0.0, arm.grip - 0.001)
                 arm._cmd(cmd)
                 time.sleep(0.05)
-        arm.glide(q_up, 0.7)
+        # every hold test failed: it was set back down after each one - leave it there, never carry a slipping grip
+        print("   !! no hold test passed: leaving it on the table")
+        return False
     finally:
         planner.az = keep
 
@@ -2607,6 +2908,98 @@ def execute(plan: Plan, planner: AzPlanner, arm: Arm, cam: LiveCamera | None, cm
         return False
 
 
+_FINDERS: dict = {}
+
+
+def _finder(path: str):
+    """A --refind module: a file exposing find(frame, cam, guess_xy) -> (x, y) or None."""
+    if path not in _FINDERS:
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(Path(path).stem, str(HERE / path if not Path(path).is_absolute() else path))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _FINDERS[path] = mod
+    return _FINDERS[path]
+
+
+REAIM_STILL = 0.004  # m: the object moved less than this - slide back in as planned
+
+
+def reaim_target(plan: Plan, planner: AzPlanner, arm: Arm, ws: "Workspace", args: "Args", idx: int,
+                 cam: LiveCamera | None, cmodel: CameraModel) -> Plan | None:
+    """Between close attempts (--refind): open, back the fingers out to this grasp's pre-pose, re-measure the
+    object on the detection camera, and re-aim the grasp at where it is now (the rest of the plan rebuilt and
+    re-validated from here). None when it is not found, moved more than --refind-max, or has no safe path."""
+    arm.set_grip(GRIP_OPEN if plan.mode == "side" else plan.open_grip, 1.2)
+    pre, slide = plan.waypoints[idx - 2], plan.waypoints[idx - 1]  # pre-grasp (or above-grasp), slide (or descend)
+    move_line(arm, planner, ws, pre.xyz, plan.yaw, plan.tilt, 2.0)
+    time.sleep(0.8)  # let the frame catch up with the arm standing still
+    frame = cam.latest() if cam is not None else None
+    if frame is None:
+        print("   (no detection camera frame to re-measure on)")
+        return None
+    off = np.array([float(v) for v in args.refind_offset.split(",")])
+    guess = np.array(plan.pick) - off  # where the camera should see it
+    try:
+        got = _finder(args.refind).find(frame, cmodel, guess)
+    except Exception as e:
+        print(f"   (re-measure failed: {e})")
+        got = None
+    if got is None:
+        print("   !! re-measure: the object was not found near where it was")
+        return None
+    new = np.asarray(got, dtype=float)[:2] + off
+    d = float(np.linalg.norm(new - np.array(plan.pick)))
+    print(f"   re-measured: now at ({got[0]:+.3f}, {got[1]:+.3f}) - {d * 100:.1f} cm from where the grasp aimed")
+    if d > args.refind_max:
+        print(f"   !! it moved more than --refind-max {args.refind_max * 100:.0f} cm: not chasing it")
+        return None
+    if d < REAIM_STILL:
+        alt = plan
+    else:
+        alt = replan(plan, planner, tuple(float(v) for v in new), args.hold, args.pause if args.rescan else 0.0)
+        alt.obj.xy = tuple(float(v) for v in new)
+        gap, who, legs, _ = validate(planner, ws, alt, arm.q(), wps=alt.waypoints[idx - 2:])
+        if gap < 0:
+            print(f"   !! no safe path to it there: {abs(gap) * 100:.1f} cm inside {who}")
+            return None
+        alt.legs = legs
+        print(f"   re-aimed: clearance {fmt_gap(gap)}" + (f" from {who}" if who else ""))
+    ws.aim(alt.obj, alt.pick)
+    for wp in alt.waypoints[idx - 2: idx]:  # to the (new) pre-grasp, then in around it again
+        move_line(arm, planner, ws, wp.xyz, alt.yaw, alt.tilt, wp.seconds, qs=wp.qs if alt is not plan else None)
+        if wp.settle:
+            try:
+                settle(arm, planner, wp.xyz[0], wp.xyz[1], wp.xyz[2], alt.yaw, alt.tilt)
+            except RuntimeError as e:
+                print(f"   (sag compensation skipped: {e})")
+    arm.set_grip(alt.open_grip, 0.8)
+    return alt
+
+
+def weigh_readout(seconds: float, live: LiveState | None = None) -> list[Path]:
+    """Wait on the scale and photograph its display: cam2 faces it. A frame half-way (the reading settling) and
+    one at the end go to captures/weigh_<cam>_<n>.jpg; the display is read from those."""
+    shots = []
+    # every open camera, fused or not: a camera left out of the fusion (background out of date) still sees
+    # the display perfectly well
+    views = {k: c for k, c in {**OPEN_CAMS, **FUSED_CAMS}.items() if k in ("cam2", "cam0")}
+    for n, dt in enumerate((seconds / 2, seconds / 2)):
+        time.sleep(dt)
+        for k, c in views.items():
+            f = c.latest()
+            if f is None:
+                continue
+            p = CAPTURES / f"weigh_{k}_{n}.jpg"
+            cv2.imwrite(str(p), f)
+            shots.append(p)
+    print(f"   scale display photographed: {', '.join(p.name for p in shots) or 'no camera open'}")
+    if live is not None:
+        live.set(phase=f"weighed - display photographed ({len(shots)} frames)")
+    return shots
+
+
 def _run_legs(plan: Plan, planner: AzPlanner, arm: Arm, cam: LiveCamera | None, cmodel: CameraModel,
               args: "Args", live: LiveState | None, ws: Workspace, step, i: int) -> bool:
     holding, carry = False, None
@@ -2642,6 +3035,8 @@ def _run_legs(plan: Plan, planner: AzPlanner, arm: Arm, cam: LiveCamera | None, 
                 return False
         elif wp.kind == "close":
             got = False
+            if args.soft:
+                empty_lift(arm, planner, plan)
             for attempt in range(1, GRASP_TRIES + 1):
                 try:  # look before closing: is the object really between the fingers?
                     centre_in_jaw(plan, planner, arm, ws, f"{i}_{attempt}")
@@ -2650,11 +3045,22 @@ def _run_legs(plan: Plan, planner: AzPlanner, arm: Arm, cam: LiveCamera | None, 
                 if grip_on_object(arm, args, plan.obj.grip_width):
                     got = True
                     break
+                if attempt < GRASP_TRIES and args.refind:
+                    # the close may have pushed it: back out, look where it really is now, re-aim - never close
+                    # again blind at a spot it may have been knocked away from
+                    print(f"   attempt {attempt}/{GRASP_TRIES} closed on nothing: back out and re-measure the object")
+                    new = reaim_target(plan, planner, arm, ws, args, i, cam, cmodel)
+                    if new is None:
+                        arm.holding = False
+                        bail(arm, planner, ws, plan, False, "the object could not be re-found and re-aimed safely")
+                        return False
+                    plan = new
+                    continue
                 if attempt < GRASP_TRIES:
                     # the camera check fixes left-right, not height: a miss on a low object is the fingers
                     # closing over its rim (the real tips ~1 cm above the model's). Open, step down, retry.
                     here = planner.fk_pos(np.array(arm.last_cmd[:6], dtype=float))
-                    z_new = max(GRASP_Z_FLOOR, here[2] - GRASP_STEP_DOWN)
+                    z_new = max(GRASP_Z_FLOOR + surface_z(here), here[2] - GRASP_STEP_DOWN)  # never into the scale
                     print(f"   attempt {attempt}/{GRASP_TRIES} closed on nothing: open, step down to "
                           f"{z_new * 100:.1f} cm, look again, retry")
                     arm.set_grip(plan.open_grip, 1.2)
@@ -2678,7 +3084,10 @@ def _run_legs(plan: Plan, planner: AzPlanner, arm: Arm, cam: LiveCamera | None, 
         elif wp.kind == "hold":
             if args.pour_over and holding:
                 do_pour(arm, planner, ws, plan, args)
-            time.sleep(wp.seconds)
+            if plan.station is not None and wp.label.startswith("weigh"):
+                weigh_readout(wp.seconds, live)
+            else:
+                time.sleep(wp.seconds)
         elif wp.kind == "rest" or (wp.kind == "pose" and not args.blend):
             goto_joint(arm, planner, np.array(REST if wp.kind == "rest" else wp.q), wp.seconds)
         elif args.brute and wp.label == "descend onto the object":
@@ -2721,6 +3130,19 @@ def _run_legs(plan: Plan, planner: AzPlanner, arm: Arm, cam: LiveCamera | None, 
                 goto_joint(arm, planner, np.array(wp.q), wp.seconds)
             else:
                 move_line(arm, planner, ws, wp.xyz, plan.yaw, plan.tilt, wp.seconds, carry, qs=wp.qs)
+            if holding and args.soft and wp.label in ("lift", "lift off the scale"):
+                from pick_bottle import load
+                e, free = load(arm, 10), getattr(arm, "free_load", 0.0)
+                s_now = SKIN.magnitude() if SKIN is not None else None
+                s_ref = getattr(arm, "skin_held", None)
+                gone_skin = s_now is not None and s_ref is not None and s_ref > 100 and s_now < 0.4 * s_ref
+                if e < free + 0.03 or gone_skin:
+                    print(f"!! after the lift the jaw reads empty (load {e:.2f}, free {free:.2f}"
+                          + ("" if s_now is None else f", skin {s_now:.0f} vs {s_ref:.0f} held") + "): it slid out")
+                    arm.holding = False
+                    bail(arm, planner, ws, plan, False, "the object slipped out during the lift")
+                    return False
+                print(f"   still holding after the lift: load {e:.2f}" + ("" if s_now is None else f", skin {s_now:.0f}"))
             if wp.settle:  # a refinement on top of a leg that already arrived: skip it if IK has no answer
                 try:
                     pos = settle(arm, planner, wp.xyz[0], wp.xyz[1], wp.xyz[2], plan.yaw, plan.tilt)
@@ -2744,7 +3166,7 @@ def _run_legs(plan: Plan, planner: AzPlanner, arm: Arm, cam: LiveCamera | None, 
                     arm.speed = getattr(arm, "speed_free", arm.speed)
                     holding, carry = False, None
                     arm.holding = False
-                    ws.aim(plan.obj, plan.place)
+                    ws.aim(plan.obj, wp.at or plan.place)
         i += 1
     print("done")
     return True
@@ -2804,6 +3226,17 @@ class Args:
     """--soft: gripper motor load (above its free-closing load) to hold the object at. The 9 cm dish flexed out of
     the jaw at ~0.45; 0.10 holds it without bending it."""
     """Gripper units (x 9.5 cm) closed past the first touch in a soft grasp: 0.005 = ~0.5 mm."""
+    neck: str | None = None
+    """"z_from,diameter" (m): the target has a narrower neck from this height up (a bottle's screw cap) and the
+    jaw closes on it - pair with --z-grasp inside the neck. For a squeezable bottle with liquid: the cap is rigid."""
+    min_mass: float | None = None
+    """--soft: kg the arm must feel hanging in the jaw at the hold test (joint torques, tared by an empty-jaw lift
+    at the same pose). Under it the object is sliding in the fingers with its base still down: firm up, retry."""
+    skin_max: float | None = None
+    """--soft: tactile skin magnitude the hold test must not firm past (default 3x the first-contact reading)."""
+    grip_load_max: float | None = None
+    """--soft: the most the hold test may firm the grip up to after slips (default --grip-load + 0.10). Keep it low
+    for things that deform or spill when squeezed (a filled wash bottle)."""
     grip_force: float | None = None
     """Cap the gripper's blocked force (N; the driver default is 50). --soft sets 10 unless given."""
     brute: bool = False
@@ -2846,6 +3279,25 @@ class Args:
     """Metres from the pick point to set the object back down."""
     place_dir: float | None = None
     """Force the place direction, degrees in the robot frame (default: the clearest one)."""
+    station: bool = False
+    """Weigh-station cycle (station.json): pick the object in the taped zone, set it on the scale top, back off
+    for --weigh seconds, take it again and put it back where it was. The scale is a fixed box obstacle."""
+    refind: str | None = None
+    """A finder module (e.g. scripts/bottle_find.py, exposing find(frame, cam, guess_xy)): before every close retry
+    the fingers back out, the object is re-measured on the detection camera and the grasp re-aimed at it."""
+    refind_offset: str = "0,0"
+    """--refind: "dx,dy" m added to a measured position to get the arm's aim (the same arm offset the --given pick
+    was corrected by)."""
+    refind_max: float = 0.05
+    """--refind: the object moved more than this since the grasp was aimed: stop instead of chasing it."""
+    palm: bool = False
+    """Seat the object against the palm: full depth only, and the gripper housing may come to 4 mm of the target
+    (it is meant to touch it). For big objects (a wash bottle's body) where the whole jaw must be engaged."""
+    station_place: str | None = None
+    """--station: "x,y" to set the object down at instead of station.json's place point (must be on the platform) -
+    e.g. nearer the base for a heavy object carried high with a flat wrist."""
+    weigh: float = 5.0
+    """--station: seconds the object sits on the scale with the gripper clear of it."""
     shuttle: bool = False
     """For repeated runs: set the object down 5 cm outward (+x) when it is nearer the base than SHUTTLE_R and
     5 cm back (-x) otherwise, so it goes back and forth between two spots instead of walking off the table."""
@@ -2885,9 +3337,10 @@ def look(args: Args) -> tuple[np.ndarray, CameraModel, list[Obj]]:
         frame = cv2.imread(args.frames)
         if frame is None:
             raise RuntimeError(f"could not read {args.frames}")
-        objs = survey(frame, cmodel, args.min_area)
+        ign = station_mask(cmodel, frame.shape[:2])
+        objs = survey(frame, cmodel, args.min_area, ignore=ign)
         if args.depth:
-            objs = fuse_depth(objs, frame, cmodel)
+            objs = fuse_depth(objs, frame, cmodel, ignore=ign)
     else:  # never overwrite the file we were asked to plan from
         frames = grab_all(args)
         frame = frames[DET]
@@ -2896,9 +3349,12 @@ def look(args: Args) -> tuple[np.ndarray, CameraModel, list[Obj]]:
             cv2.imwrite(str(CAPTURES / ("survey.jpg" if k == DET else f"survey_{k}.jpg")), f)
         cams = still_cameras(frames, cams)
         frames = {k: f for k, f in frames.items() if k in cams}
-        objs = survey_multi(frames, cams, args.min_area)
+        ign = station_ignore(frames, cams)
+        objs = survey_multi(frames, cams, args.min_area, ignore=ign)
         if args.depth:
-            objs = fuse_depth(objs, frame, cams[DET], more=grab_more(DET, DEPTH_FRAMES - 1))
+            objs = fuse_depth(objs, frame, cams[DET], ignore=ign[DET] if ign else None,
+                              more=grab_more(DET, DEPTH_FRAMES - 1))
+    objs = off_station(objs)
     objs = with_given(objs, args)
     if not objs:
         raise RuntimeError(f"nothing in the zone that is not in {BACKGROUND[DET].name} - either it is "
@@ -2906,8 +3362,36 @@ def look(args: Args) -> tuple[np.ndarray, CameraModel, list[Obj]]:
     return frame, cmodel, objs
 
 
+def station_ignore(frames: dict, cams: dict) -> dict | None:
+    """Per-camera masks of the weigh station for detection and depth (None without --station)."""
+    if STATION is None:
+        return None
+    return {k: station_mask(cams[k], f.shape[:2], grow=25) for k, f in frames.items() if k in cams}
+
+
+def off_station(objs: list[Obj]) -> list[Obj]:
+    """Drop what was read on or against the weigh station: it is the station."""
+    if STATION is None:
+        return objs
+    fp = np.array(STATION["footprint"])
+    # depth smears the scale's top edge into the table beside it: a depth-only blob this close is that
+    near = lambda o: poly_sd(o.xy, fp)[0] < (STATION_DEPTH_BAND if o.xy_uncertain else 0.01)
+    for o in [o for o in objs if near(o)]:
+        print(f"   (ignoring {o.name} at {np.round(o.xy, 3)}: on or against the weigh station)")
+    return [o for o in objs if not near(o)]
+
+
 def with_given(objs: list[Obj], args: "Args") -> list[Obj]:
-    """--given prepended as object 0; a detection within 6 cm of it is the same object and dropped."""
+    """--given prepended as object 0 (with its --neck); a detection within 6 cm of it is the same object and dropped."""
+    objs = _with_given(objs, args)
+    if args.neck and objs:
+        zf, dn = (float(v) for v in args.neck.split(","))
+        objs[0].neck = (zf, dn)
+        print(f"   {objs[0].name}: gripping its neck - {dn * 100:.1f} cm wide from {zf * 100:.1f} cm up")
+    return objs
+
+
+def _with_given(objs: list[Obj], args: "Args") -> list[Obj]:
     if not args.given:
         return objs
     out = []
@@ -2985,9 +3469,12 @@ def stage_scene(args: Args) -> None:
     # the world from the cameras that are still where they were calibrated (a moved cam2 carved a 6 cm
     # bottle into a 24 x 8 cm slab), refined by the depth analysis; every camera is still drawn
     still = still_cameras(frames, cams)
-    objs = survey_multi({k: f for k, f in frames.items() if k in still}, still, args.min_area)
+    ign = station_ignore(frames, still)
+    objs = survey_multi({k: f for k, f in frames.items() if k in still}, still, args.min_area, ignore=ign)
     if args.depth and DET in still:
-        objs = fuse_depth(objs, frames[DET], still[DET], more=grab_more(DET, DEPTH_FRAMES - 1))
+        objs = fuse_depth(objs, frames[DET], still[DET], ignore=ign[DET] if ign else None,
+                          more=grab_more(DET, DEPTH_FRAMES - 1))
+    objs = off_station(objs)
     for o in objs:
         print(f"   {o.describe()}")
     meshes = []  # live_map.build poses the arm itself; scene.json only needs the q
@@ -3140,6 +3627,7 @@ def stage_run(args: Args) -> None:
                     more.append(cams[DET].latest())
                 objs = fuse_depth(objs, frames[DET], models[DET], ignore=masks.get(DET), more=more)
             FUSED_CAMS.update({k: cams[k] for k in models if k in cams})
+            OPEN_CAMS.update(cams)
             FUSED_MODELS.update(models)
             zone = load_zone()
             if zone is not None:  # the fused top view, re-rendered by LiveState for the map
@@ -3230,8 +3718,24 @@ def stage_run(args: Args) -> None:
 
 
 def main(args: Args) -> None:
-    global JAW_ACROSS, MAX_OBJ_WIDTH, SIDE_TILTS, TABLE_SLACK, CAM_MOVED_PX, TIP_PROBE
+    global JAW_ACROSS, MAX_OBJ_WIDTH, SIDE_TILTS, TABLE_SLACK, CAM_MOVED_PX, TIP_PROBE, STATION
+    global TARGET_TOL, TALL_TOL, SEAT_BACKOFFS
     TIP_PROBE = float(args.tip_probe)
+    if args.palm:  # the palm is meant to touch the object: seat it fully, no shallower fallbacks
+        TARGET_TOL = TALL_TOL = 0.004
+        SEAT_BACKOFFS = (0.0,)
+        print("palm grasp: the object is seated against the gripper housing (full finger depth)")
+    if args.station:
+        STATION = load_station()
+        if args.station_place:
+            xy = [float(v) for v in args.station_place.split(",")]
+            if poly_sd(np.array(xy), np.array(STATION["footprint"]))[0] > -0.05:
+                raise SystemExit(f"--station-place {xy} is not at least 5 cm inside the scale platform")
+            STATION["place"] = xy
+        if args.task == Args.task:
+            args.task = "pick up the object, set it on the scale, then put it back where it was"
+        print(f"weigh station: top {STATION['top_z'] * 100:.1f} cm, place point {STATION['place']}, "
+              f"{args.weigh:.0f} s on the scale")
     CAM_MOVED_PX = float(args.cam_moved_px)
     TABLE_SLACK = float(args.table_slack)
     SIDE_TILTS = tuple(float(np.radians(t)) for t in args.side_tilt)

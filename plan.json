@@ -2,35 +2,123 @@
   "object": {
     "name": "given",
     "xy": [
-      0.2811,
-      -0.108
+      0.2829,
+      0.0726
     ],
-    "diameter": 0.09,
-    "height": 0.015,
-    "flatness": 0.16666666666666666
+    "diameter": 0.0785,
+    "height": 0.22,
+    "flatness": 2.8025477707006368
   },
-  "obstacles": [],
+  "obstacles": [
+    {
+      "name": "scale",
+      "xy": [
+        0.3029,
+        -0.11875000000000001
+      ],
+      "diameter": 0.0,
+      "height": 0.052,
+      "footprint": [
+        [
+          0.2143,
+          -0.0181
+        ],
+        [
+          0.2124,
+          -0.2177
+        ],
+        [
+          0.3915,
+          -0.2194
+        ],
+        [
+          0.3934,
+          -0.0198
+        ]
+      ]
+    }
+  ],
+  "station": {
+    "top_z": 0.052,
+    "board_outline": [
+      [
+        0.3741,
+        -0.0324
+      ],
+      [
+        0.3806,
+        -0.1973
+      ],
+      [
+        0.2607,
+        -0.2021
+      ],
+      [
+        0.2542,
+        -0.0372
+      ]
+    ],
+    "board_centre": [
+      0.3174,
+      -0.1172
+    ],
+    "board_yaw_deg": -87.73856038371908,
+    "placed_by": "cam1",
+    "board": {
+      "squares": [
+        11,
+        8
+      ],
+      "square_m": 0.015,
+      "legacy": true,
+      "dict": "DICT_4X4_50"
+    },
+    "footprint": [
+      [
+        0.2143,
+        -0.0181
+      ],
+      [
+        0.2124,
+        -0.2177
+      ],
+      [
+        0.3915,
+        -0.2194
+      ],
+      [
+        0.3934,
+        -0.0198
+      ]
+    ],
+    "place": [
+      0.3175,
+      -0.1158
+    ],
+    "footprint_from": "4 top-surface corners read in cam0, back-projected at top_z; checked in cam1/cam2 overlays",
+    "scale": "Amazon Basics shipping scale (30 kg / 1 g)"
+  },
   "grasp": {
-    "mode": "top",
-    "reason": "forced by --grasp top",
+    "mode": "side",
+    "reason": "forced by --grasp side",
     "yaw": 3.141592653589793,
-    "tilt": 0.25,
-    "approach_azimuth": null,
-    "z_grasp": 0.01,
+    "tilt": 1.3089969389957472,
+    "approach_azimuth": -0.09879321610745856,
+    "z_grasp": 0.08,
     "open_grip": 1.0
   },
   "pick": [
-    0.2811,
-    -0.108
+    0.2829,
+    0.0726
   ],
   "place": [
-    0.30596643302289595,
-    -0.15137811093994102
+    0.3175,
+    -0.1158
   ],
-  "z_travel": 0.2,
-  "clearance_m": 1000000000.0,
-  "tightest_against": "",
-  "low_point_m": 0.008616580654224756,
+  "z_travel": 0.335,
+  "clearance_m": 0.001007501302489739,
+  "tightest_against": "the target itself",
+  "low_point_m": 0.0651100028335596,
   "visual_check": {
     "enabled": true,
     "note": ""
@@ -46,26 +134,26 @@
       "kind": "pose",
       "grip": 1.0,
       "seconds": 3.0,
-      "clearance_m": 1000000000.0
+      "clearance_m": 0.07221770290988774
     },
     {
       "label": "above the object",
       "xyz": [
-        0.2811,
-        -0.108,
-        0.2
+        0.2829,
+        0.0726,
+        0.335
       ],
       "kind": "joint",
       "grip": null,
       "seconds": 4.0,
-      "clearance_m": 1000000000.0
+      "clearance_m": 0.18892306082849794
     },
     {
       "label": "look at the scene again",
       "xyz": [
-        0.2811,
-        -0.108,
-        0.2
+        0.2829,
+        0.0726,
+        0.335
       ],
       "kind": "rescan",
       "grip": null,
@@ -73,35 +161,35 @@
       "clearance_m": null
     },
     {
-      "label": "above the grasp height",
+      "label": "pre-grasp beside the object",
       "xyz": [
-        0.2811,
-        -0.108,
-        0.04
+        0.16899591666664124,
+        0.08388970418702663,
+        0.11914638057175626
       ],
       "kind": "line",
       "grip": null,
       "seconds": 3.0,
-      "clearance_m": 1000000000.0
+      "clearance_m": 0.09963690067824374
     },
     {
-      "label": "descend onto the object",
+      "label": "slide the fingers around it",
       "xyz": [
-        0.2811,
-        -0.108,
-        0.01
+        0.3143798204577064,
+        0.06947984969083079,
+        0.08
       ],
       "kind": "line",
       "grip": null,
-      "seconds": 1.5,
-      "clearance_m": 1000000000.0
+      "seconds": 3.0,
+      "clearance_m": 0.001021925712887107
     },
     {
       "label": "close on the object",
       "xyz": [
-        0.2811,
-        -0.108,
-        0.01
+        0.3143798204577064,
+        0.06947984969083079,
+        0.08
       ],
       "kind": "close",
       "grip": null,
@@ -111,21 +199,21 @@
     {
       "label": "lift",
       "xyz": [
-        0.2811,
-        -0.108,
-        0.2
+        0.3143798204577064,
+        0.06947984969083079,
+        0.335
       ],
       "kind": "line",
       "grip": null,
       "seconds": 3.0,
-      "clearance_m": 1000000000.0
+      "clearance_m": 0.03409105426668686
     },
     {
       "label": "hold 5 s",
       "xyz": [
-        0.2811,
-        -0.108,
-        0.2
+        0.3143798204577064,
+        0.06947984969083079,
+        0.335
       ],
       "kind": "hold",
       "grip": null,
@@ -135,9 +223,9 @@
     {
       "label": "look at the scene again",
       "xyz": [
-        0.2811,
-        -0.108,
-        0.2
+        0.2829,
+        0.0726,
+        0.335
       ],
       "kind": "rescan",
       "grip": null,
@@ -145,11 +233,11 @@
       "clearance_m": null
     },
     {
-      "label": "carry to the place point",
+      "label": "carry onto the scale",
       "xyz": [
-        0.30596643302289595,
-        -0.15137811093994102,
-        0.2
+        0.3489798204577065,
+        -0.1189201503091692,
+        0.335
       ],
       "kind": "line",
       "grip": null,
@@ -157,11 +245,11 @@
       "clearance_m": 1000000000.0
     },
     {
-      "label": "lower",
+      "label": "lower onto the scale",
       "xyz": [
-        0.30596643302289595,
-        -0.15137811093994102,
-        0.01
+        0.3489798204577065,
+        -0.1189201503091692,
+        0.132
       ],
       "kind": "line",
       "grip": null,
@@ -171,9 +259,9 @@
     {
       "label": "release",
       "xyz": [
-        0.30596643302289595,
-        -0.15137811093994102,
-        0.01
+        0.3489798204577065,
+        -0.1189201503091692,
+        0.132
       ],
       "kind": "line",
       "grip": 1.0,
@@ -181,16 +269,148 @@
       "clearance_m": 1000000000.0
     },
     {
-      "label": "clear of the table",
+      "label": "back the fingers out",
       "xyz": [
-        0.30596643302289595,
-        -0.15137811093994102,
-        0.2
+        0.2035959166666413,
+        -0.10451029581297337,
+        0.17114638057175627
       ],
       "kind": "line",
       "grip": null,
       "seconds": 2.5,
+      "clearance_m": 0.001007501302489739
+    },
+    {
+      "label": "clear of the scale",
+      "xyz": [
+        0.3489798204577065,
+        -0.1189201503091692,
+        0.335
+      ],
+      "kind": "line",
+      "grip": null,
+      "seconds": 2.5,
+      "clearance_m": 0.06298557766084001
+    },
+    {
+      "label": "weigh 8 s",
+      "xyz": [
+        0.3489798204577065,
+        -0.1189201503091692,
+        0.335
+      ],
+      "kind": "hold",
+      "grip": null,
+      "seconds": 8.0,
+      "clearance_m": null
+    },
+    {
+      "label": "back beside it on the scale",
+      "xyz": [
+        0.2035959166666413,
+        -0.10451029581297337,
+        0.17114638057175627
+      ],
+      "kind": "line",
+      "grip": null,
+      "seconds": 3.0,
+      "clearance_m": 0.06234045948799119
+    },
+    {
+      "label": "slide the fingers around it again",
+      "xyz": [
+        0.3489798204577065,
+        -0.1189201503091692,
+        0.132
+      ],
+      "kind": "line",
+      "grip": null,
+      "seconds": 3.0,
+      "clearance_m": 0.0016559702018382992
+    },
+    {
+      "label": "close on it on the scale",
+      "xyz": [
+        0.3489798204577065,
+        -0.1189201503091692,
+        0.132
+      ],
+      "kind": "close",
+      "grip": null,
+      "seconds": 0.0,
+      "clearance_m": null
+    },
+    {
+      "label": "lift off the scale",
+      "xyz": [
+        0.3489798204577065,
+        -0.1189201503091692,
+        0.335
+      ],
+      "kind": "line",
+      "grip": null,
+      "seconds": 3.0,
       "clearance_m": 1000000000.0
+    },
+    {
+      "label": "carry back to where it was",
+      "xyz": [
+        0.3143798204577064,
+        0.06947984969083079,
+        0.335
+      ],
+      "kind": "line",
+      "grip": null,
+      "seconds": 3.5,
+      "clearance_m": 1000000000.0
+    },
+    {
+      "label": "lower back down",
+      "xyz": [
+        0.3143798204577064,
+        0.06947984969083079,
+        0.08
+      ],
+      "kind": "line",
+      "grip": null,
+      "seconds": 3.0,
+      "clearance_m": 0.03495167525005061
+    },
+    {
+      "label": "release it back",
+      "xyz": [
+        0.3143798204577064,
+        0.06947984969083079,
+        0.08
+      ],
+      "kind": "line",
+      "grip": 1.0,
+      "seconds": 1.5,
+      "clearance_m": 0.03505272660346437
+    },
+    {
+      "label": "back the fingers out again",
+      "xyz": [
+        0.16899591666664124,
+        0.08388970418702663,
+        0.11914638057175626
+      ],
+      "kind": "line",
+      "grip": null,
+      "seconds": 2.5,
+      "clearance_m": 0.0010083111982548583
+    },
+    {
+      "label": "clear of the table",
+      "xyz": [
+        0.3143798204577064,
+        0.06947984969083079,
+        0.335
+      ],
+      "kind": "line",
+      "grip": null,
+      "seconds": 2.5,
+      "clearance_m": 0.0865605022266498
     },
     {
       "label": "fold back to ready",
@@ -202,7 +422,7 @@
       "kind": "pose",
       "grip": null,
       "seconds": 3.5,
-      "clearance_m": 1000000000.0
+      "clearance_m": 0.19111419469839858
     },
     {
       "label": "return to rest",
@@ -214,7 +434,7 @@
       "kind": "rest",
       "grip": null,
       "seconds": 3.0,
-      "clearance_m": 1000000000.0
+      "clearance_m": 0.07221770290988774
     }
   ]
 }

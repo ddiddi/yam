@@ -150,6 +150,8 @@ def build(scene_path: Path = HERE / "scene.json", out: Path = PAGE) -> Path:
         "calibration_points": scene["calibration_points"],
         "robot": {"geoms": geoms},
         "zone": json.loads((HERE / "zone.json").read_text())["polygon"] if (HERE / "zone.json").exists() else [],
+        # the weigh station (station.json): drawn as a fixed box, its top the place surface
+        "station": json.loads((HERE / "station.json").read_text()) if (HERE / "station.json").exists() else None,
         # what the page shows until (or without) a live update
         "top_meta": scene.get("top", {}).get("meta"),
         # sensors + the depth world (map_world.py): cameras' drift, depth fit, the skin, the height map

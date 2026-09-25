@@ -1,0 +1,60 @@
+{
+ "top_z": 0.052,
+ "board_outline": [
+  [
+   0.3741,
+   -0.0324
+  ],
+  [
+   0.3806,
+   -0.1973
+  ],
+  [
+   0.2607,
+   -0.2021
+  ],
+  [
+   0.2542,
+   -0.0372
+  ]
+ ],
+ "board_centre": [
+  0.3174,
+  -0.1172
+ ],
+ "board_yaw_deg": -87.73856038371908,
+ "placed_by": "cam1",
+ "board": {
+  "squares": [
+   11,
+   8
+  ],
+  "square_m": 0.015,
+  "legacy": true,
+  "dict": "DICT_4X4_50"
+ },
+ "footprint": [
+  [
+   0.2143,
+   -0.0181
+  ],
+  [
+   0.2124,
+   -0.2177
+  ],
+  [
+   0.3915,
+   -0.2194
+  ],
+  [
+   0.3934,
+   -0.0198
+  ]
+ ],
+ "place": [
+  0.3175,
+  -0.1158
+ ],
+ "footprint_from": "4 top-surface corners read in cam0, back-projected at top_z; checked in cam1/cam2 overlays",
+ "scale": "Amazon Basics shipping scale (30 kg / 1 g)"
+}
