@@ -3095,6 +3095,11 @@ def bottle_tilt_path(planner: AzPlanner, ws: "Workspace", q_level: np.ndarray, a
 
 POUR_MAX_LEAD = 0.015  # grip units (1.4 mm): the command may run at most this far ahead of the jaw
 POUR_LOOSEN = 0.004  # grip units (0.4 mm): how far the jaw eases off after the pour, slowly, for the carry home
+POUR_OZ_PER_MM = 0.12  # first guess of oz pushed out per mm of squeeze once it flows (run 8: ~0.1-0.15)
+POUR_AIM = 0.6  # size each step for this fraction of what is left (the display lags, the dose trails the squeeze)
+POUR_MIN_STEP_MM, POUR_MAX_STEP_MM = 0.3, 3.0
+POUR_PROBE_FAR, POUR_PROBE_MM, POUR_PROBE_NEAR_MM = 1.5, 0.5, 6.0  # probe steps (mm) before/after 6 mm of squeeze
+POUR_MAX_STEPS = 60
 POUR_STEP_DRY = 0.0020  # grip units (x 9.5 cm) closed per step before anything flows (~0.19 mm)
 POUR_STEP_FLOW = 0.0008  # ... once it flows (~0.08 mm): the flow follows the squeeze
 POUR_DT = 0.25  # s between squeeze steps
@@ -3171,9 +3176,10 @@ def squeeze_pour(arm: Arm, plan: Plan, args: "Args", live: LiveState | None = No
         print("   !! the scale display cannot be read - not pouring")
         return None
     print(f"   scale before the pour: {base:.1f} oz; pouring {target:.1f} oz -> {base + target:.1f} oz")
-    if abs(base) > 0.3:
-        # the bowl was tared: a reading now means the bottle (or the arm) rests on the scale - its weight would
-        # swamp the pour and the stop would never come
+    if abs(base) > 1.5:
+        # the bowl was tared: a big reading now means the bottle (or the arm) rests on the scale - its weight would
+        # swamp the pour and the stop would never come (attempt 1: 10.1 oz). The empty scale's zero itself drifts
+        # 0.3-0.8 oz per load cycle (run 7 read 0.6 with nothing touching): the pour counts from `base` anyway
         print(f"   !! the scale reads {base:.1f} oz before pouring (expected ~0 with the bowl tared): something rests "
               "on it - not squeezing")
         return None
@@ -3183,77 +3189,63 @@ def squeeze_pour(arm: Arm, plan: Plan, args: "Args", live: LiveState | None = No
     g_min = max(0.0, g_hold - args.pour_max_squeeze / JAW_STROKE)
     s_hold = SKIN.magnitude() if SKIN is not None else None
     s_cap = args.skin_max if args.skin_max is not None else (None if s_hold is None else 3.0 * max(s_hold, 100.0))
-    g_flow = None  # the grip at which it first flowed: top-up pulses start just before it
-    w_hist: list[tuple[float, float]] = []  # (t, reading) while squeezing
-    final = base
-    for pulse in range(1, 6):
-        stop_reason = "limit"
-        misses, stalled = 0, 0.0
-        while arm.grip > g_min:
-            w = reading()
-            sample(f"squeeze{pulse}", w)
-            if w is None:
-                misses += 1
-                if misses * POUR_DT > 3.0:
-                    stop_reason = "display unreadable"
-                    break
-                time.sleep(POUR_DT)
-                continue
-            misses = 0
-            now = time.time()
-            w_hist.append((now, w))
-            if g_flow is None and w >= base + 0.2:
-                g_flow = arm.grip
-                print(f"   flowing at {(g_hold - arm.grip) * JAW_STROKE * 1000:.1f} mm past the held grip "
-                      f"(skin {SKIN.magnitude():.0f})" if SKIN is not None else "   flowing")
-            recent = [(t, v) for t, v in w_hist if now - t <= 1.5]
-            rate = max(0.0, (recent[-1][1] - recent[0][1]) / max(recent[-1][0] - recent[0][0], 0.3)) if len(recent) >= 2 else 0.0
-            if w + rate * POUR_LAG >= goal - 0.05:
-                stop_reason = f"at {w:.1f} oz, flowing {rate:.2f} oz/s"
-                break
-            if s_cap is not None and SKIN is not None and SKIN.magnitude() >= s_cap:
-                stop_reason = "the skin cap"
-                break
-            g_pos, g_load = float(arm.state7()[6]), load(arm, 2)
-            if g_load >= args.pour_load_max:
-                # the motor is at its squeeze budget: winding the command further only runs it into the force cap
-                # (attempt 1: 8 mm commanded past where the jaw stood, load 1.04) and adds nothing
-                stop_reason = f"the load cap ({g_load:.2f})"
-                break
-            if arm.grip < g_pos - POUR_MAX_LEAD:
-                # the jaw lags the command: the wall pushes back - wait for it instead of winding further
+    # Dose in steps. The scale's display holds its value while the load changes (run 8: 1.5 oz for 25 s of flow,
+    # then 2.2 once it stopped) and a stream's impact spikes it (5.5 oz), so it is only trusted settled. The squeezed
+    # bottle is a displacement pump: each step of squeeze pushes out a dose once the air inside is pressurised, and
+    # the flow stops by itself once the jaw holds still. Probe in small steps until it flows, then size each step
+    # from the measured oz per mm, never re-opening between steps (that lets the collapsed bottle go slack).
+    final, k, g_flow, n = base, POUR_OZ_PER_MM, None, 0
+    stop_reason = "on target"
+    while True:
+        poured = final - base
+        left = target - poured
+        if left <= POUR_TOL / 2:
+            break
+        n += 1
+        if n > POUR_MAX_STEPS:
+            stop_reason = f"{POUR_MAX_STEPS} steps"
+            break
+        sq = (g_hold - arm.grip) * JAW_STROKE * 1000
+        if g_flow is None:
+            mm = POUR_PROBE_FAR if sq < POUR_PROBE_NEAR_MM else POUR_PROBE_MM
+        else:
+            mm = float(np.clip(POUR_AIM * left / k, POUR_MIN_STEP_MM, POUR_MAX_STEP_MM))
+        g_to = max(g_min, arm.grip - mm / 1000 / JAW_STROKE)
+        if g_to >= arm.grip - 1e-6:
+            stop_reason = f"the squeeze limit ({args.pour_max_squeeze * 1000:.0f} mm)"
+            break
+        stalled = 0.0
+        while arm.grip > g_to + 1e-6:
+            g_pos = float(arm.state7()[6])
+            if arm.grip < g_pos - POUR_MAX_LEAD:  # the wall pushes back: wait for the jaw
                 stalled += POUR_DT
                 if stalled > 3.0:
-                    stop_reason = f"stalled {(g_hold - g_pos) * JAW_STROKE * 1000:.1f} mm in, load {g_load:.2f}"
                     break
-                time.sleep(POUR_DT)
-                continue
-            stalled = 0.0
-            arm.grip = max(g_min, arm.grip - (POUR_STEP_FLOW if g_flow is not None else POUR_STEP_DRY))
-            arm._cmd(q)
-            if live is not None:
-                live.set(phase=f"squeeze-pour: {w - base:.1f} / {target:.1f} oz")
+            else:
+                arm.grip = max(g_to, arm.grip - POUR_STEP_DRY)
+                arm._cmd(q)
+            sample(f"step{n}", None)
             time.sleep(POUR_DT)
-        # stop: relax the squeeze a little and softly, from where the jaw actually stands, and let the reading settle
-        arm.grip = min(arm.grip, float(arm.state7()[6]))
-        loosen(arm, q, POUR_RELAX)
-        final = settled(POUR_SETTLE, f"settle{pulse}")
-        poured = None if final is None else final - base
-        print(f"   pulse {pulse}: stopped ({stop_reason}); settled at "
-              + ("unreadable" if final is None else f"{final:.1f} oz - poured {poured:.1f} of {target:.1f} oz"))
-        if final is None or stop_reason in ("display unreadable", "the skin cap"):
+        if stalled > 3.0:
+            stop_reason = f"stalled {(g_hold - float(arm.state7()[6])) * JAW_STROKE * 1000:.1f} mm in"
             break
-        if poured >= target - POUR_TOL:
+        if live is not None:
+            live.set(phase=f"squeeze-pour: step {n}, {poured:.1f} / {target:.1f} oz")
+        w = settled(POUR_SETTLE, f"settle{n}")
+        if w is None:
+            stop_reason = "display unreadable"
             break
-        if stop_reason.startswith(("the load cap", "stalled")) and g_flow is None:
-            print("   !! the bottle cannot be squeezed further and nothing flowed - stopping")
-            break
-        if arm.grip <= g_min + 1e-6 and stop_reason == "limit":
-            print(f"   !! reached the squeeze limit ({args.pour_max_squeeze * 1000:.0f} mm) - stopping short")
-            break
-        # top up: carry on squeezing from where the jaw stands - re-opening to where it first flowed (run 6: from
-        # 29 mm back to 8 mm) let the collapsed bottle go slack in the jaw
-        time.sleep(0.3)
+        d = w - final
+        sq = (g_hold - arm.grip) * JAW_STROKE * 1000
+        if g_flow is None and w >= base + 0.2:  # two display counts: one can be a flicker
+            g_flow = arm.grip
+            print(f"   flowing at {sq:.1f} mm past the held grip" + (f" (skin {SKIN.magnitude():.0f})" if SKIN is not None else ""))
+        elif g_flow is not None and d > 0.05:
+            k = 0.5 * k + 0.5 * max(0.02, d / mm)  # oz per mm, learned
+        final = w
+        print(f"   step {n}: +{mm:.1f} mm (squeeze {sq:.1f} mm) -> {w:.1f} oz, poured {w - base:.1f} of {target:.1f}"
+              + (f", {k:.2f} oz/mm" if g_flow is not None else ""))
+    print(f"   pour done ({stop_reason}): poured {final - base:.1f} of {target:.1f} oz")
     # after the pour: loosen very softly and very little from where the jaw stands. Opening back to the held grip
     # (run 6: 29 mm wider - the squeezed wall does not spring back) leaves the bottle hanging at load 0.06 and it
     # slides out on the way home
