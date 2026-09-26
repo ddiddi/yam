@@ -3696,6 +3696,9 @@ class Args:
     tactile_port: str | None = None
     """Serial port of the skin (default: the first /dev/cu.usbmodem*/usbserial* found)."""
     given_only: bool = False
+    pick_json: str | None = None
+    """A pick file from annotate_pick.py (object bounds + the two fingertip points marked by hand): the target, grasp
+    centre, jaw direction, jaw width and grasp height all come from it (a top-down grasp, --given-only)."""
     """With --given: use only the given objects, dropping every detection (a lying hammer's handle is detected
     as a separate short cylinder)."""
     jaw_across: str | None = None
@@ -4187,6 +4190,17 @@ def main(args: Args) -> None:
     global JAW_ACROSS, MAX_OBJ_WIDTH, SIDE_TILTS, TABLE_SLACK, CAM_MOVED_PX, TIP_PROBE, STATION
     global TARGET_TOL, TALL_TOL, SEAT_BACKOFFS, FAST, VALIDATE_STEP, SCAN_N
     TIP_PROBE = float(args.tip_probe)
+    if args.pick_json:
+        pk = json.loads(Path(args.pick_json).read_text())
+        g, o = pk["grasp"], pk["object"]
+        target = f"{g['centre'][0]:.4f},{g['centre'][1]:.4f},{max(g['width'], 0.008):.4f},{max(o['height'], g['z'] + 0.005):.4f}"
+        # anything else already given stays an obstacle after the marked target
+        args.given = target + (";" + args.given if args.given else "")
+        args.given_only, args.object = True, 0
+        args.grasp, args.z_grasp = "top", float(g["z"])
+        args.jaw_across = f"{g['jaw_across'][0]:.4f},{g['jaw_across'][1]:.4f}"
+        print(f"pick file {args.pick_json}: grasp at {g['centre']} z {g['z'] * 1000:.0f} mm, jaw {g['width'] * 1000:.0f} mm "
+              f"closing along {g['close_dir']}; object {o['height'] * 1000:.0f} mm tall")
     if args.fast:
         FAST, VALIDATE_STEP, SCAN_N = True, 0.05, 4
         args.depth, args.rescan = False, False
