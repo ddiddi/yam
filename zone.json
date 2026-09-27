@@ -2,39 +2,47 @@
  "camera": "cam1",
  "polygon": [
   [
-   0.1492,
-   -0.2818
+   0.3224,
+   0.3995
   ],
   [
-   0.4257,
-   -0.2888
+   0.1207,
+   0.3816
   ],
   [
-   0.4614,
-   0.2574
+   0.1266,
+   -0.132
   ],
   [
-   0.0928,
-   0.177
+   0.3876,
+   -0.1432
+  ],
+  [
+   0.425,
+   -0.0507
+  ],
+  [
+   0.4559,
+   0.2587
   ]
  ],
- "what": "outer edge of the blue tape incl. the strip added 2026-09-24 on the +y side; the scale inside it is station.json",
+ "what": "visible outer edge of the blue tape (cam1 view, cut at the frame edge), 2026-09-26 setup, no scale",
  "white_sheet_polygon": [
   [
-   0.1789,
-   0.0277
+   0.3852,
+   0.1924
   ],
   [
-   0.1838,
-   -0.2404
+   0.3677,
+   -0.0893
   ],
   [
-   0.3786,
-   -0.2339
+   0.1758,
+   -0.0843
   ],
   [
-   0.3741,
-   0.0303
+   0.1903,
+   0.1942
   ]
  ]
 }
