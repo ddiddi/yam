@@ -699,10 +699,28 @@ def soft_close(arm: "Arm", start: float | None = None, preload: float = 0.005, s
     good = good or capped
     print(f"   grip check: opening {m * 95:.1f} mm ({(touch - m) * 95:+.1f} mm past the touch), load {e:.2f} "
           f"(target {target:.2f}) -> " + (("OK (firm: the load plateaus under the force cap), lifting" if capped else "OK, lifting")
-                                         if good and e > e0 + 0.03 else "NO LOAD - not holding"))
+                                         if good and e > e0 + 0.03 else
+                                         "firmer than the target - easing off" if e > target + band else "under the target - firming up" if e > e0 + 0.03 and (touch - m) * 95 < 3.0 else "NO LOAD - not holding"))
+    def firm_up(g, e, m):
+        """Close in half-steps back into the band, while the fingers stay stalled at the touch; an empty jaw would
+        close on past it instead. -> (grip command, load, opening, ok)"""
+        for _ in range(30):
+            g = max(0.0, g - step / 2)
+            arm.grip = g
+            arm._cmd(np.array(arm.last_cmd[:6], dtype=float))
+            time.sleep(0.05)
+            e = load(arm, 6)
+            m = float(arm.state7()[6])
+            if (touch - m) * 95 > 3.0:
+                break
+            if e >= target - band:
+                print(f"   firmed to load {e:.2f} at {m * 95:.1f} mm")
+                return g, e, m, True
+        return g, e, m, False
+
     if not good and e > target + band:  # still too hard after the servo: open to the target load, then accept
-        for _ in range(20):
-            g = min(1.0, g + step)
+        for _ in range(40):
+            g = min(1.0, g + step / 2)
             arm.grip = g
             arm._cmd(np.array(arm.last_cmd[:6], dtype=float))
             time.sleep(0.05)
@@ -711,7 +729,22 @@ def soft_close(arm: "Arm", start: float | None = None, preload: float = 0.005, s
                 good = True
                 print(f"   eased to load {e:.2f} at {float(arm.state7()[6]) * 95:.1f} mm")
                 break
+        else:
+            # a grip still a little firm (load noise, or the pads' skin creeping) is a grip, not an empty jaw: it
+            # was counted as a miss and forced a needless re-grasp (vial run, 2026-09-27: 0.24 against 0.18)
+            if e <= target + 3 * band:
+                good = True
+                print(f"   held a little firm (load {e:.2f}, target {target:.2f}) - accepted")
         m = float(arm.state7()[6])
+        if good and e < target - band and (touch - m) * 95 < 3.0:
+            # the pads stick and then slip: one ease step dropped the load from 0.23 straight to 0.04 at the same
+            # opening, and that counted as an empty jaw (vial run, 2026-09-27, move 72) - close back to the target
+            g, e, m, good = firm_up(g, e, m)
+    elif not good and e > e0 + 0.03 and (touch - m) * 95 < 3.0:
+        # a little under the band with the fingers still stalled at the touch: the pads' skin relaxed after the servo
+        # settled - a grip, not an empty jaw (vial run, 2026-09-27: 0.12 against 0.17, +0.3 mm past the touch, forced
+        # a re-grasp)
+        g, e, m, good = firm_up(g, e, m)
     return m if (good and e > e0 + 0.03) else 0.0
 
 

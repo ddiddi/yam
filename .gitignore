@@ -17,3 +17,6 @@ scene_viewer.html
 
 # large model weights (depth.py downloads instructions in its docstring)
 models/*.onnx
+
+# built locally by tools/build_uvc_util.sh
+tools/uvc-util

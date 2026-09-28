@@ -5,6 +5,7 @@ Sharp and colour-based, so a clear object (the glass vial) is found as reliably 
     python scripts/sticker_find.py x,y diameter height [--show out.jpg] [--hue 18,38]  ->  "x,y,area" or nothing
 """
 import sys
+import time
 
 import cv2
 import numpy as np
@@ -14,9 +15,19 @@ SEARCH = 0.08  # m: only a sticker whose axis lands this close to the guess coun
 MIN_AREA = 25  # px
 
 
-def find(frame, cam, guess, h, hue=(22, 40)):  # a pale sticker in bright light reads S~50: keep the saturation cut low
+def find(frame, cam, guess, h, hue=(22, 40)):
+    """A pale sticker in bright light reads S~50; blown out (V 255, e.g. on the white sheet) only S~8-20: try the
+    normal saturation cut first, then a low one."""
+    for sat in (22, 12):
+        b = _find(frame, cam, guess, h, hue, sat)
+        if b is not None:
+            return b
+    return None
+
+
+def _find(frame, cam, guess, h, hue, sat):
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    m = ((hsv[..., 0] >= hue[0]) & (hsv[..., 0] <= hue[1]) & (hsv[..., 1] > 22) & (hsv[..., 2] > 170)).astype(np.uint8)
+    m = ((hsv[..., 0] >= hue[0]) & (hsv[..., 0] <= hue[1]) & (hsv[..., 1] > sat) & (hsv[..., 2] > 170)).astype(np.uint8)
     m = cv2.morphologyEx(m, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
     n, lab, st, cen = cv2.connectedComponentsWithStats(m)
     best = None
@@ -38,8 +49,25 @@ if __name__ == "__main__":
     h = float(sys.argv[3])
     hue = tuple(int(v) for v in sys.argv[sys.argv.index("--hue") + 1].split(",")) if "--hue" in sys.argv else (18, 38)
     cam = load_cameras()["cam1"]
-    frame = grab(1)
-    b = find(frame, cam, g, h, hue)
+    # grab() reopens the camera and returns after 1.5 s, before its auto-exposure settles (the sticker reads blown
+    # out, or not at all): keep one capture open, watch it for up to 6 s and keep the biggest sticker blob - a big
+    # blob is a well-exposed sticker and the most accurate centroid
+    from scene3d import device_index
+    cap = cv2.VideoCapture(device_index(1))
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    b, frame, f, t0 = None, None, None, time.time()
+    while time.time() - t0 < 6.0:
+        ok, f = cap.read()
+        if not ok or time.time() - t0 < 1.0:
+            continue
+        c = find(f, cam, g, h, hue)
+        if c is not None and (b is None or c[2] > b[2]):
+            b, frame = c, f
+        if b is not None and b[2] >= 150 and time.time() - t0 > 2.5:
+            break
+    cap.release()
+    frame = frame if frame is not None else f
     if "--show" in sys.argv:
         v = frame.copy()
         if b is not None:
