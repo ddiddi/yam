@@ -1,7 +1,8 @@
 """Merge every recorded LeRobot dataset under datasets/ into one VLA training set (LeRobot v2.1):
 
-    python scripts/export_vla.py [--out datasets/yam_vla] [--all]
+    python scripts/export_vla.py [--out datasets/yam_vla] [--all] [--task-has vial]
 
+- --task-has TEXT: only episodes whose task contains TEXT (e.g. `--task-has vial --out datasets/yam_vial`)
 - episodes: only runs marked completed in their dataset's meta/episode_plans.jsonl (--all: every episode, with the
   completion flag in the manifest); datasets without plans are listed in the manifest and left out unless --all
 - cameras: two consistent views - observation.images.main = cam1 (the detection camera in every setup) and
@@ -24,6 +25,7 @@ import pyarrow.parquet as pq
 ROOT = Path(__file__).resolve().parents[1] / "datasets"
 OUT = Path(sys.argv[sys.argv.index("--out") + 1]) if "--out" in sys.argv else ROOT / "yam_vla"
 ALL = "--all" in sys.argv
+TASK_HAS = sys.argv[sys.argv.index("--task-has") + 1].lower() if "--task-has" in sys.argv else None
 CAMS = {"observation.images.cam1": "observation.images.main", "observation.images.cam0": "observation.images.aux"}
 
 
@@ -39,7 +41,7 @@ episodes, stats, sources, skipped = [], [], [], []
 features = None
 gidx = 0  # global frame index
 ep_out = 0
-for src in sorted(p for p in ROOT.iterdir() if p.is_dir() and p != OUT and (p / "meta" / "info.json").exists()):
+for src in sorted(p for p in ROOT.iterdir() if p.is_dir() and p != OUT and not (p / "meta" / "sources.jsonl").exists() and (p / "meta" / "info.json").exists()):
     info = json.loads((src / "meta" / "info.json").read_text())
     if not all(k in info["features"] for k in CAMS):
         skipped.append({"dataset": src.name, "why": f"lacks {[k for k in CAMS if k not in info['features']]}"})
@@ -58,6 +60,8 @@ for src in sorted(p for p in ROOT.iterdir() if p.is_dir() and p != OUT and (p / 
         chunk = i // info["chunks_size"]
         pq_in = src / info["data_path"].format(episode_chunk=chunk, episode_index=i)
         vids = {k: src / info["video_path"].format(episode_chunk=chunk, video_key=k, episode_index=i) for k in CAMS}
+        if TASK_HAS and TASK_HAS not in ep["tasks"][0].lower():
+            continue
         if not ALL and ok is not True:
             skipped.append({**row, "why": "not marked completed" if ok is False else "no success record"})
             continue
